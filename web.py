@@ -1,0 +1,3784 @@
+"""Web interface for ScholarMate. Pure stdlib.
+
+- POST /ask          queues a run and returns a job id (async, non-blocking)
+- GET  /status?id=   polls a job: stage, streaming log, final payload
+- GET  /history      lists persisted run snapshots
+- GET  /history/<id> fetches one snapshot (answer, audits, papers, exports)
+- GET  /screening?run=<id>   screening ledger (纳入/排除/待定 + 理由 + 备注)
+- POST /screening    records one decision and returns the updated ledger
+- GET  /scoring      evidence-scoring dimensions, presets and saved weights
+- POST /scoring      saves the per-dimension weights / target species
+
+Snapshots are saved under outputs/history/*.json so results survive restarts.
+"""
+
+import argparse
+import base64
+import contextvars
+import datetime
+import io
+import json
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import atomicio
+import docexport
+import exports
+import graph
+import jobstore
+import journal
+import pdfpack
+import rerank
+import scoring
+import screening
+import search
+
+HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "history")
+os.makedirs(HISTORY_DIR, exist_ok=True)
+
+# Concurrent connections one web process will handle. Browsers keep several
+# sockets open per tab, so this is a runaway guard, not a throughput target.
+MAX_CONNECTIONS = int(os.environ.get("WEB_MAX_CONNECTIONS", "128"))
+
+# How many runs execute at the same time in this process. One by default, which
+# means a second visitor's run waits in the queue for the whole duration of the
+# first one -- a deliberate default, because every run also spends external
+# quota (DeepSeek / Semantic Scholar / SerpAPI) and the sources share one
+# circuit-breaker table. The task table already hands each run to exactly one
+# worker (`claim_next()`), so raising this just adds claimers.
+CONCURRENCY = max(1, int(os.environ.get("WEB_CONCURRENCY", "1")))
+
+# Only the job(s) executing in this process are held in memory, so that a
+# running job has an exact, instantly-readable stage/log for /status. Every job
+# -- queued, running, finished or failed -- has a row in the task table
+# (jobstore), which is what survives a restart and what a second worker process
+# would claim from.
+_active = {}
+_active_lock = threading.Lock()
+_wake = threading.Event()       # the worker sleeps here instead of polling
+PROGRESS_FLUSH_S = float(os.environ.get("PROGRESS_FLUSH_S", "2"))
+
+# Every browser gets an anonymous owner token, and every run is filed under it.
+# It is a cookie rather than a login because the requirement is "two people on
+# the same link must not read each other's work", and a token does that without
+# asking anyone to manage an account; real accounts slot in at the same seam.
+COOKIE_NAME = "sm_owner"
+OWNER_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _cookie_owner(raw):
+    for part in (raw or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == COOKIE_NAME and OWNER_RE.match(value or ""):
+            return value
+    return None
+
+
+def _owner_cookie(owner):
+    return (f"{COOKIE_NAME}={owner}; Path=/; Max-Age=31536000; "
+            "SameSite=Lax; HttpOnly")
+_current_year = datetime.date.today().year
+YEAR_WINDOWS = {"any": None, "y1": 1, "y3": 3, "y5": 5}
+
+
+def _job_id():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _get_job(jid, owner=None):
+    """The job, or None -- and None when it belongs to somebody else.
+
+    Passing `owner` is how the web layer refuses to act on another browser's
+    run. A run with no owner (written before owners existed) is readable by
+    nobody until someone adopts it, which is what keeps the history written
+    before this change from staying shared.
+    """
+    live = _live_job(jid)
+    job = live if live is not None else jobstore.get(jid)
+    if job is None:
+        return None
+    if owner is not None and (job.get("owner") or "") != owner:
+        return None
+    return job
+
+
+def _live_job(jid):
+    """The in-process copy of a job, or None when it is not running here.
+
+    Only a running job is mutable in place; a finished job read back from the
+    table is a copy, so writing to it would be a silent no-op. Callers that
+    mean to change a job's record have to save it back.
+    """
+    with _active_lock:
+        return _active.get(str(jid))
+
+
+def _enqueue(job, owner=None):
+    """File a job under its owner in the task table, then nudge the worker."""
+    if owner is not None:
+        job["owner"] = owner
+    jobstore.save(job)
+    _wake.set()
+
+
+def _touch(job, force=False):
+    """Write the streaming half of a live job through to the task table.
+
+    The log arrives line by line, far too fast to write every one, so this is
+    throttled. /status reads the live copy in memory (exact); the table is at
+    most PROGRESS_FLUSH_S behind, which is all a restart could use anyway.
+    """
+    now = time.time()
+    if not force and now - job.get("_flush_at", 0.0) < PROGRESS_FLUSH_S:
+        return
+    job["_flush_at"] = now
+    jobstore.save_progress(job["id"], job)
+
+
+def _run_key(job):
+    """The key that names one run, for the checkpoint thread and for stopping it."""
+    return job.get("thread_id") or job["id"]
+
+
+def _cancel_job(jid, owner=None):
+    """Stop a queued or running job. Returns (http status, payload).
+
+    A running pipeline cannot be killed (Python threads have no kill), so the
+    stop is cooperative: `graph.request_cancel(run_key)` makes *that* run raise
+    at its next checkpoint -- every node boundary, every retrieval round and
+    every claim of the per-sentence check -- while every other run carries on.
+    A job that has not started yet is simply dropped.
+    """
+    if not jid:
+        return 400, {"error": "id is required"}
+    job = _get_job(jid, owner)
+    if job is None:
+        return 404, {"error": "任务表里没有这个 id"}
+    status = job.get("status")
+    if status not in ("queued", "running"):
+        return 409, {"error": f"任务已经结束（{status}），无需停止", "status": status}
+    key = _run_key(job)
+    job["cancel"] = True
+    # save it back: a job that is still queued only exists in the table, and the
+    # worker takes its own copy from there -- the flag has to survive the trip
+    jobstore.save(job)
+    # set the event even for a still-queued job: it may flip to running between
+    # the check above and this call, and the worker's own queued-cancel test is
+    # what actually drops it. No other run can see this event -- it is keyed.
+    graph.request_cancel(key)
+    return 202, {"ok": True, "id": jid, "status": status, "cancel_requested": True}
+
+
+def _filters_from_payload(payload):
+    years = YEAR_WINDOWS.get(payload.get("window", "any"))
+    filters = {"min_year": None, "max_year": None, "review_only": False, "venue": "",
+               "tiers": [], "keep_others": False}
+    if years:
+        filters["min_year"] = _current_year - years
+    filters["review_only"] = bool(payload.get("review_only"))
+    filters["venue"] = str(payload.get("venue") or "").strip()
+    # 正刊/子刊/一区-四区 boxes (see journal.py). Unknown keys are dropped rather
+    # than kept, so the filter can never end up enabled by a stray value.
+    tiers = payload.get("tiers")
+    if isinstance(tiers, str):
+        tiers = [tiers]
+    filters["tiers"] = [t for t in (tiers or []) if t in journal.TIER_KEYS]
+    filters["keep_others"] = bool(payload.get("keep_others"))
+    return filters
+
+
+def _filters_label(filters):
+    parts = []
+    if filters.get("min_year"):
+        parts.append(f"{filters['min_year']} 年至今")
+    if filters.get("review_only"):
+        parts.append("仅综述")
+    if filters.get("venue"):
+        parts.append(f"刊物/会议含“{filters['venue']}”")
+    tiers = [t for t in (filters.get("tiers") or []) if t in journal.TIER_KEYS]
+    if tiers:
+        label = "、".join(journal.TIER_LABELS[t] for t in tiers)
+        if filters.get("keep_others"):
+            label += "（含会议/预印本/未分类）"
+        parts.append(f"刊物层级：{label}")
+    return "、".join(parts) or "不限"
+
+
+# ---------------------------------------------------------------- composition
+
+def _paper_meta(p):
+    meta = {k: p.get(k) for k in (
+        "title", "year", "citations", "url", "pdf_url", "doi", "arxiv_id",
+        "source", "seen_sources", "authors", "venue",
+        "retracted", "retraction_source", "retraction_note", "retraction_doi",
+        "via_classic", "evidence", "evidence_score",
+    )}
+    meta["authors"] = (meta.get("authors") or [])[:12]
+    meta["abstract"] = (p.get("abstract") or "")[:600]
+    # stable identity the screening ledger is keyed on (and the UI stores it in
+    # the card so a click never has to recompute it)
+    meta["key"] = screening.paper_key(p)
+    return meta
+
+
+def _compose(job, result, duration):
+    papers = result.get("papers") or []
+    audits = {
+        "rules": result.get("rule_audit") or {"lines": [], "items": []},
+        "llm": result.get("llm_audit") or {"lines": [], "verdicts": []},
+        "claims": result.get("claim_audit") or {
+            "lines": [], "verdicts": [], "passages_used": 0, "parse_failures": [],
+        },
+    }
+    sort_label = graph.SEARCH_SORT_LABELS.get(job.get("sort", "relevance"), "相关性")
+    data = {
+        "id": job["id"],
+        "owner": job.get("owner") or "",
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "question": job["question"],
+        "mode": job["mode"],
+        "sort": job["sort"],
+        "sort_label": sort_label,
+        "filters": job.get("filters") or {},
+        "filters_label": _filters_label(job.get("filters") or {}),
+        "duration_s": round(duration, 1),
+        "answer": result.get("answer", ""),
+        "deep_verify": job.get("deep_verify", True),
+        "papers": [_paper_meta(p) for p in papers],
+        "retraction": result.get("retraction") or {
+            "total": 0, "checked": 0, "retracted": 0, "unchecked": 0,
+        },
+        "evidence": result.get("evidence") or {},
+        "retrieval_log": result.get("retrieval_log") or [],
+        "sources": search.source_status(),
+        "timings": result.get("timings") or {},
+        "tier_filter": result.get("tier_filter") or {},
+        "scores": result.get("scores") or [],
+        "audits": audits,
+        "reports": result.get("reports") or [],
+        "directions": result.get("directions") or job.get("directions") or [],
+        "explore_path": job.get("path") or [],
+    }
+    data["counts"] = {
+        "rule": _count_rules(audits["rules"]),
+        "llm": _count_llm(audits["llm"]),
+        "claims": _count_claims(audits["claims"]),
+    }
+    data["exports"] = {
+        "bibtex": exports.bibtex(papers),
+        "ris": exports.ris(papers),
+        "gbt": exports.gbt7714(papers),
+        "csl": exports.csl_json(papers),
+    }
+    data["per_paper_bibtex"] = exports.per_paper_bibtex(papers)
+    return data
+
+
+def _count_rules(audit):
+    items = audit.get("items") or []
+    return {
+        "ok": sum(1 for i in items if i.get("status") == "ok"),
+        "warn": sum(1 for i in items if i.get("status") == "warn"),
+        "bad": sum(1 for i in items if i.get("status") == "bad"),
+    }
+
+
+def _count_llm(audit):
+    verdicts = audit.get("verdicts") or []
+    return {"supported": sum(1 for v in verdicts if v.get("supported")),
+            "unsupported": sum(1 for v in verdicts if not v.get("supported"))}
+
+
+BADGE_KEYS = ("cross", "fulltext", "abstract", "unknown", "unsupported")
+
+
+def _count_claims(audit):
+    if audit.get("skipped"):
+        return {"supported": 0, "unsupported": 0, "passages_used": 0,
+                "evidence_snippets": 0, "evidence_fulltext": 0, "evidence_abstract": 0,
+                "badges": {}, "skipped": True}
+    verdicts = audit.get("verdicts") or []
+    fulltext = abstract = snippets = 0
+    badges = {}
+    for c in verdicts:
+        key = c.get("badge")
+        if key not in BADGE_KEYS:
+            key = "unsupported" if not c.get("supported") else "unknown"
+        badges[key] = badges.get(key, 0) + 1
+        for e in c.get("evidence") or []:
+            count = len(e.get("passages") or [])
+            if e.get("source") == "abstract":
+                abstract += count
+            else:
+                fulltext += count
+            snippets += count
+    return {"supported": sum(1 for c in verdicts if c.get("supported")),
+            "unsupported": sum(1 for c in verdicts if not c.get("supported")),
+            "passages_used": audit.get("passages_used") or 0,
+            "evidence_papers": sum(len(c.get("evidence") or []) for c in verdicts),
+            "evidence_snippets": snippets,
+            "evidence_fulltext": fulltext,
+            "evidence_abstract": abstract,
+            "badges": badges,
+            "fulltext_stats": audit.get("fulltext_stats") or {}}
+
+
+def _run_path(run_id):
+    return os.path.join(HISTORY_DIR, run_id + ".json")
+
+
+def _chat_history(run_id):
+    """Turns already exchanged on this run, oldest first."""
+    job = _get_job(run_id)
+    if job is not None and isinstance(job.get("chat"), list) and job["chat"]:
+        return [dict(t) for t in job["chat"]]
+    path = _run_path(run_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            snap = json.load(f)
+    except Exception:
+        return []
+    return [t for t in (snap.get("chat") or []) if isinstance(t, dict)]
+
+
+def _append_chat_turn(run_id, *turns, papers=None):
+    """Persist turns into the run's own snapshot, so reloading a run restores
+    the conversation (the follow-up turn is part of that run's record).
+
+    When a follow-up fetched its own papers they are appended to the run's
+    working set *and* to every export derived from it -- the paper list the UI
+    shows and the .bib the user downloads have to agree with the [n] numbers
+    the conversation now uses. Returns the merged paper list.
+    """
+    path = _run_path(run_id)
+    snap = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                snap = json.load(f)
+        except Exception:
+            snap = {}
+    chat = snap.setdefault("chat", [])
+    chat.extend(turns)
+    if papers:
+        merged = list(snap.get("papers") or []) + list(papers)
+        snap["papers"] = merged
+        try:
+            snap["exports"] = {
+                "bibtex": exports.bibtex(merged), "ris": exports.ris(merged),
+                "gbt": exports.gbt7714(merged), "csl": exports.csl_json(merged),
+            }
+            snap["per_paper_bibtex"] = exports.per_paper_bibtex(merged)
+        except Exception:
+            pass
+    try:
+        atomicio.write_json(path, snap)
+    except OSError:
+        pass
+    merged = list(snap.get("papers") or [])
+    job = _get_job(run_id)
+    if job is not None:
+        job.setdefault("chat", []).extend(turns)
+        if papers:
+            # keep the row equal to the snapshot: /history/<id> is served from
+            # the table now, so a merged working set that only made it into the
+            # file would come back short
+            job["papers"] = merged
+            job["exports"] = snap.get("exports") or job.get("exports")
+            job["per_paper_bibtex"] = (snap.get("per_paper_bibtex")
+                                       or job.get("per_paper_bibtex"))
+        jobstore.save(job)          # a follow-up survives a restart, too
+    return merged
+
+
+def _explore_history(run_id):
+    """Exploration turns already made in this session, oldest first."""
+    path = _run_path(run_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            snap = json.load(f)
+    except Exception:
+        return []
+    return [t for t in (snap.get("explore") or []) if isinstance(t, dict)]
+
+
+def _append_explore(run_id, turn):
+    """Persist one exploration turn into the session's own snapshot: the path
+    the user walked *is* the record, so reopening it from history restores the
+    whole session and the report can still be requested from it."""
+    path = _run_path(run_id)
+    snap = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                snap = json.load(f)
+        except Exception:
+            snap = {}
+    snap.setdefault("id", run_id)
+    snap.setdefault("mode", "explore")
+    snap.setdefault("created_at", datetime.datetime.now().isoformat(timespec="seconds"))
+    snap.setdefault("papers", [])
+    snap.setdefault("answer", "")
+    snap["explore"] = (snap.get("explore") or []) + [turn]
+    try:
+        atomicio.write_json(path, snap)
+    except OSError:
+        pass
+    job = _get_job(run_id)
+    if job is not None:
+        job.setdefault("explore", []).append(turn)
+        jobstore.save(job)          # the path the user walked survives a restart
+
+
+def _explore_turn(job, result, duration):
+    """One exploration turn, in the shape the UI and the next turn read."""
+    meta = result.get("explore_meta") or {}
+    return {
+        "role": "assistant",
+        "action": job.get("action") or "scope",
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "topic": job.get("question") or "",
+        "parent": job.get("direction") or {},
+        "path": list(job.get("path") or []),
+        "directions": result.get("explore_directions") or [],
+        "degraded": bool(meta.get("degraded")),
+        "with_refs": meta.get("with_refs", 0),
+        "duration_s": round(duration, 1),
+        "timings": result.get("timings") or {},
+    }
+
+
+def _run_explore_job(job, on_stage):
+    """The exploration branch: propose the next layer of directions."""
+    return graph.run_explore(
+        job.get("action") or "scope",
+        topic=job.get("question") or "",
+        parent=job.get("direction") or {},
+        path=job.get("path") or [],
+        seen=job.get("seen") or [],
+        preview=job.get("preview", True),
+        on_stage=on_stage,
+        thread_id=job.get("thread_id") or job["id"],
+    )
+
+
+def _chat_turn(job, result, duration):
+    """One answered follow-up, in the shape the UI and the next turn both read."""
+    audit = result.get("chat_audit") or {"lines": [], "items": []}
+    meta = result.get("chat_meta") or {}
+    return {
+        "role": "assistant",
+        "content": result.get("chat_answer") or "",
+        "question": job.get("message") or "",
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "duration_s": round(duration, 1),
+        "audit": audit,
+        "counts": _count_rules(audit),
+        "needs_new_search": bool(meta.get("needs_new_search")),
+        "search_query": meta.get("search_query") or "",
+        "fetched": result.get("chat_log") or [],
+        "papers_added": len(result.get("chat_new_papers") or []),
+        "timings": result.get("timings") or {},
+    }
+
+
+def _run_chat_job(job, on_stage):
+    """The interactive branch: answer one follow-up inside the run's papers.
+
+    Re-reads the run instead of trusting the client, so the conversation can
+    only ever be grounded in the working set that produced the answer.
+    """
+    parent = _load_job_or_snapshot(job.get("run_id") or "")
+    if parent is None:
+        raise RuntimeError("原始运行记录已不存在，无法追问（该运行未落盘或已被清理）")
+    return graph.run_chat(
+        job.get("message") or "",
+        question=parent.get("question", ""),
+        answer=parent.get("answer", ""),
+        papers=parent.get("papers") or [],
+        history=_chat_history(job["run_id"]),
+        allow_retrieve=job.get("allow_retrieve", True),
+        filters=parent.get("filters") or {},
+        on_stage=on_stage,
+        thread_id=job.get("thread_id") or job["id"],
+    )
+
+
+def _save_history(data):
+    # persist the full run payload so history rows re-render identically
+    path = os.path.join(HISTORY_DIR, data["id"] + ".json")
+    try:
+        atomicio.write_json(path, data)
+    except OSError:
+        pass
+
+
+def _rerank_existing(job):
+    """Re-score an already retrieved search result set with the LLM and update
+    the stored job in place (no re-search happens). Returns True on success."""
+    try:
+        papers = job.get("papers") or []
+        if not papers:
+            return False
+        ranked = rerank.rerank_papers(job.get("question", ""), papers, top_k=None)
+        if not ranked:
+            return False
+        ordered = [p for p, _ in ranked]
+        scores = [{"title": p["title"], "score": round(s, 2)} for p, s in ranked]
+        job["papers"] = ordered
+        job["scores"] = scores
+        job["sort"] = "relevance"
+        job["sort_label"] = "相关性"
+        job["answer"] = graph.format_papers(ordered, "相关性")
+        job["exports"] = {
+            "bibtex": exports.bibtex(ordered),
+            "ris": exports.ris(ordered),
+            "gbt": exports.gbt7714(ordered),
+            "csl": exports.csl_json(ordered),
+        }
+        job["per_paper_bibtex"] = exports.per_paper_bibtex(ordered)
+        return True
+    except Exception as e:
+        job["rerank_error"] = f"{type(e).__name__}: {e}"
+        return False
+
+
+# ---------------------------------------------------------------- worker
+
+# The job whose console output is being captured in this thread's context.
+# A context variable rather than sys.stdout swapping: see _StdoutRouter below.
+_log_sink = contextvars.ContextVar("web_log_sink", default=None)
+
+
+class _StdoutRouter(io.TextIOBase):
+    """Send each print() to the log of the run whose thread printed it.
+
+    `contextlib.redirect_stdout` swaps the process-wide sys.stdout, which is
+    fine while one run executes at a time and wrong as soon as two overlap: the
+    job that installed its tee last would collect both runs' lines and the other
+    job's log would come out empty. Here the sink travels in a context variable,
+    and every thread pool a run starts is handed a copy of that context, so a
+    line lands in its own job's log. A thread that belongs to no run writes
+    straight to the console.
+
+    It replaces sys.stdout for the whole process, so it has to be transparent:
+    it stays open and never complains, and a write from an unknown thread goes
+    to the real stdout exactly as before.
+    """
+    writing = False
+
+    def write(self, text):
+        sink = _log_sink.get()
+        if sink is not None:
+            return sink.write(text)
+        try:
+            return sys.__stdout__.write(text)
+        except Exception:
+            return len(text)
+
+    def flush(self):
+        sink = _log_sink.get()
+        try:
+            (sink.flush() if sink is not None else sys.__stdout__.flush())
+        except Exception:
+            pass
+
+
+sys.stdout = _StdoutRouter()
+
+
+class _Tee:
+    """Write graph stdout to both the console and the job log buffer."""
+
+    def __init__(self, job):
+        self.job = job
+        self.pending = ""
+
+    def write(self, s):
+        if not s:
+            return len(s)
+        try:
+            sys.__stdout__.write(s)
+            sys.__stdout__.flush()
+        except Exception:
+            pass
+        self.pending += s
+        while "\n" in self.pending:
+            line, self.pending = self.pending.split("\n", 1)
+            with _active_lock:
+                if "log" not in self.job:
+                    self.job["log"] = []
+                self.job["log"].append(line)
+            _touch(self.job)
+        return len(s)
+
+    def flush(self):
+        if self.pending:
+            with _active_lock:
+                self.job.setdefault("log", []).append(self.pending)
+            self.pending = ""
+        _touch(self.job, force=True)
+
+
+def _worker():
+    while True:
+        job = jobstore.claim_next()
+        if job is None:
+            _wake.wait(1.0)
+            _wake.clear()
+            continue
+        with _active_lock:
+            _active[job["id"]] = job   # the live copy /status reads while it runs
+        run_key = _run_key(job)
+        graph.begin_run(run_key)        # the pipeline looks up its own event by this
+        try:
+            if job.get("cancel"):        # stopped while it was still queued
+                job.update({"status": "cancelled", "stage": "⏹ 已停止（排队时被取消）"})
+                continue
+            job.update({"status": "running", "stage": "排队中…",
+                        "started_at": datetime.datetime.now().isoformat(timespec="seconds")})
+            _touch(job, force=True)
+            if job.get("cancel"):        # the stop landed while we were starting
+                graph.request_cancel(run_key)
+            t0 = time.time()
+
+            def on_stage(text):
+                with _active_lock:
+                    job["stage"] = text
+                    job["stages"] = job.get("stages", []) + [text]
+                _touch(job, force=True)
+
+            tee = _Tee(job)
+            cancelled = False
+            _log_token = _log_sink.set(tee)
+            try:
+                try:
+                    result = (_run_explore_job(job, on_stage)
+                              if job.get("mode") == "explore"
+                              else _run_chat_job(job, on_stage)
+                              if job.get("mode") == "chat" else graph.run_full(
+                        job["question"], mode=job["mode"], sort=job["sort"],
+                        filters=job.get("filters"), on_stage=on_stage,
+                        deep_verify=job.get("deep_verify", True),
+                        score_evidence=job.get("score_evidence", False),
+                        weights=job.get("weights"), target_species=job.get("target_species", ""),
+                        screen_retractions=job.get("screen_retractions"),
+                        thread_id=run_key,
+                        resume=bool(job.get("resume_thread")),
+                        directions=job.get("directions"),
+                    ))
+                except graph.JobCancelled as e:
+                    # keep the checkpoint: the run can still be resumed, and the
+                    # snapshot tells the user how far it got before stopping
+                    cancelled = True
+                    state = graph.snapshot_state(run_key)
+                    with _active_lock:
+                        job.update({
+                            "status": "cancelled", "stage": "⏹ 已停止",
+                            "cancel_reason": str(e),
+                            "papers_done": len(state.get("papers") or []),
+                            "pool_size": len(state.get("pool") or {}),
+                            "rounds_done": state.get("rounds", 0),
+                        })
+            finally:
+                _log_sink.reset(_log_token)
+            if cancelled:
+                continue
+            if job.get("mode") == "explore":
+                # an exploration turn is not a run either: it appends to the
+                # session's own record and never writes papers/answer
+                turn = _explore_turn(job, result, time.time() - t0)
+                with _active_lock:
+                    job.update({"explore_turn": turn, "status": "done",
+                                "stage": "✅ 完成", "duration_s": turn["duration_s"]})
+                _append_explore(job["run_id"], turn)
+                graph.drop_checkpoint(run_key)
+                continue
+            if job.get("mode") == "chat":
+                # a follow-up turn is not a new run: append it to the run's own
+                # record instead of writing a snapshot of its own
+                turn = _chat_turn(job, result, time.time() - t0)
+                fresh = [_paper_meta(p) for p in (result.get("chat_new_papers") or [])]
+                turn["new_papers"] = fresh
+                with _active_lock:
+                    job.update({"chat_turn": turn, "status": "done", "stage": "✅ 完成",
+                                "duration_s": turn["duration_s"]})
+                merged = _append_chat_turn(job["run_id"],
+                                           {"role": "user", "content": job.get("message") or "",
+                                            "created_at": turn["created_at"]},
+                                           turn, papers=fresh)
+                if fresh:
+                    with _active_lock:
+                        job["chat_papers"] = merged
+                graph.drop_checkpoint(run_key)
+                continue
+            data = _compose(job, result, time.time() - t0)
+            with _active_lock:
+                job.update(data)
+                job["status"] = "done"
+                job["stage"] = "✅ 完成"
+            _save_history(data)
+            # a finished run does not need its snapshots; keep the memory bound
+            # (failed runs keep theirs so they can be resumed)
+            graph.prune_checkpoints()
+        except Exception as e:
+            with _active_lock:
+                job["status"] = "error"
+                job["stage"] = "❌ 失败"
+                job["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            graph.end_run(run_key)
+            with _active_lock:
+                job["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                _active.pop(job["id"], None)
+            jobstore.save(job)          # the durable record, whatever happened
+
+
+# The task table has to be ready before the worker can take anything from it:
+# adopt the snapshots written before it existed, then settle whatever the last
+# process left running (its checkpoints died with it).
+jobstore.init()
+_adopted = jobstore.import_history(HISTORY_DIR)
+_settled = jobstore.recover()
+if _adopted or _settled:
+    print(f"[jobstore] 任务表就绪：接管历史快照 {_adopted} 条，标记重启中断 {len(_settled)} 条")
+for _n in range(CONCURRENCY):
+    threading.Thread(target=_worker, daemon=True).start()
+if CONCURRENCY > 1:
+    print(f"[web] 并发执行 {CONCURRENCY} 个运行（WEB_CONCURRENCY）")
+
+
+def _history_index(owner):
+    """The last 20 finished runs belonging to this browser.
+
+    This used to list the snapshot directory, which meant every visitor to the
+    link got handed everybody else's titles. The index now comes from the task
+    table, filtered by owner, and reads only the few small fields the list
+    prints instead of parsing each run's payload to render a title.
+    """
+    return jobstore.list_recent(owner)
+
+
+PAGE = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScholarMate</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --field:#0d1016; --sunk:#10131a;
+          --line:#232834; --line2:#2a2f3a; --hover:rgba(255,255,255,.06);
+          --fg:#e6e8ee; --strong:#fff; --body:#c8d0dc; --muted:#8b93a7;
+          --markbg:rgba(255,107,107,.22); --markfg:#ffb3b3;
+          --accent:#4f8cff; --good:#3ecf8e; --bad:#ff6b6b; --warn:#f5b942;
+          color-scheme:dark; }
+  /* 白天/投影/打印阅读：同一套结构换一套变量，减少长时间注视的眩光 */
+  :root.light { --bg:#f7f8fa; --card:#fff; --field:#f2f4f7; --sunk:#eef1f5;
+          --line:#e4e8ee; --line2:#d3d9e2; --hover:rgba(0,0,0,.05);
+          --fg:#1c222c; --strong:#000; --body:#2b323e; --muted:#5e6a7c;
+          --markbg:rgba(200,56,47,.13); --markfg:#a3271f;
+          --accent:#2563eb; --good:#0f8f5f; --bad:#c8382f; --warn:#8f6400;
+          color-scheme:light; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC",sans-serif;
+         font-size:15px; line-height:1.6;
+         background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased; }
+  /* 首屏内容整体在视口里垂直居中（不再贴着顶端）；结果变长后自然回到常规文档流 */
+  main { max-width:1000px; margin:0 auto; min-height:100vh; position:relative;
+         display:flex; flex-direction:column; justify-content:center;
+         padding:56px 20px 96px; }
+  /* 品牌名留在左上角（与内容同一条左边线），搜索框才占据页面中轴 */
+  h1 { font-size:42px; font-weight:700; letter-spacing:.5px; margin:14px 0 36px;
+       color:var(--strong); text-shadow:0 0 30px rgba(79,140,255,.22); }
+  h1 .brand2 { color:var(--accent); }
+  #theme { position:absolute; top:24px; right:20px; }
+  .controls { background:var(--card); border:1px solid var(--line); border-radius:14px;
+              padding:12px 14px; margin-bottom:14px; }
+  .modes { display:inline-flex; gap:2px; padding:3px; margin-bottom:12px; font-size:13.5px;
+           color:var(--muted); background:var(--bg); border:1px solid var(--line); border-radius:10px; }
+  .mode { display:flex; align-items:center; gap:6px; cursor:pointer; padding:6px 14px;
+          border-radius:8px; transition:background .15s, color .15s; }
+  .mode:hover { color:var(--fg); }
+  .mode input { position:absolute; width:1px; height:1px; margin:0; opacity:0; pointer-events:none; }
+  .mode:focus-within { outline:1px solid var(--accent); outline-offset:2px; }
+  .mode.active { background:var(--accent); color:#fff; }
+  .optrow { display:flex; align-items:center; gap:10px;
+            font-size:13px; color:var(--muted); flex-wrap:wrap; }
+  .optrow + .optrow { margin-top:10px; }
+  .optrow label { display:flex; align-items:center; gap:5px; cursor:pointer; }
+  .optrow input[type=checkbox] { margin:0; accent-color:var(--accent); }
+  .optrow input[type=text] { background:var(--field); }
+  select { padding:7px 10px; border-radius:8px; border:1px solid var(--line2);
+           background:var(--field); color:var(--fg); font-size:13.5px; outline:none; }
+  #sorts { display:none; }
+  #sorts.visible { display:flex; }
+  form { display:flex; gap:10px; }
+  #stop { background:transparent; color:var(--bad); font-weight:400; padding:11px 18px;
+          border:1px solid rgba(255,107,107,.55); }
+  #stop:hover:not(:disabled) { background:rgba(255,107,107,.12); border-color:var(--bad);
+                               filter:none; }
+  input[type=text] { flex:1; min-width:0; padding:12px 14px; border-radius:10px;
+           border:1px solid var(--line2); background:var(--card); color:var(--fg);
+           font-size:15px; outline:none; }
+  input[type=text]:focus { border-color:var(--accent); }
+  button { padding:11px 20px; border:0; border-radius:10px; background:var(--accent);
+           color:#fff; font-size:14px; font-weight:600; cursor:pointer; transition:filter .15s; }
+  button:hover:not(:disabled) { filter:brightness(1.12); }
+  button:disabled { opacity:.5; cursor:wait; }
+  button.ghost { background:transparent; color:var(--muted); border:1px solid var(--line2);
+                 padding:6px 12px; font-size:12px; font-weight:400; }
+  button.ghost:hover:not(:disabled) { color:var(--fg); border-color:var(--accent); filter:none; }
+  button.mini { padding:3px 8px; font-size:11px; border-radius:6px; }
+  #progress { display:none; margin-top:14px; padding:12px 14px; border:1px solid var(--line2);
+              border-radius:10px; background:var(--card); }
+  #progress.visible { display:block; }
+  #stage { color:var(--accent); font-size:14.5px; }
+  pre#log { white-space:pre-wrap; font-family:ui-monospace,Menlo,Consolas,monospace;
+            font-size:12px; color:var(--muted); background:var(--sunk);
+            border:1px solid var(--line); border-radius:10px; padding:14px;
+            margin-top:14px; max-height:260px; overflow:auto; }
+  #answer { margin-top:20px; line-height:1.8; }
+  #answerbox { font-size:15px; line-height:1.85; }
+  #answerbox p, #answerbox li, .claim { max-width:84ch; }
+  #answer h2 { font-size:19px; margin:24px 0 8px; }
+  #answer h3 { font-size:15.5px; margin:18px 0 6px; }
+  #answer strong { color:var(--strong); }
+  #answer p { margin:9px 0; }
+  #answer a.cite { color:var(--accent); text-decoration:none; font-weight:600; }
+  /* 回答很长时，参考文献与工作论文集默认折叠，正文保持干净 */
+  #answer details.refs { margin-top:14px; border-top:1px solid var(--line); padding-top:8px; }
+  #answer details.refs > summary { cursor:pointer; color:var(--muted); font-size:13px;
+        font-weight:600; list-style:none; }
+  #answer details.refs > summary::-webkit-details-marker { display:none; }
+  #answer details.refs > summary:hover { color:var(--fg); }
+  #answer details.refs p { color:var(--body); font-size:13px; line-height:1.75;
+        margin:6px 0; padding-left:6px; border-left:2px solid var(--line2); }
+  .paper.flash { background:var(--markbg); transition:background .25s ease; }
+  #answer a { color:var(--accent); }
+  mark.unsup { background:var(--markbg); color:var(--markfg);
+               border-radius:4px; padding:0 2px; }
+  .bar { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
+  /* 导出条：空的时候不占位，有内容时自成一张卡片，免得被当成装饰忽略掉 */
+  #toolbar:empty { margin-top:0; }
+  #toolbar:not(:empty) { background:var(--card); border:1px solid var(--line);
+                         border-radius:12px; padding:10px 12px; align-items:center; }
+  #toolbar .slab { color:var(--muted); font-size:12.5px; margin-right:2px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:12px;
+           padding:12px 14px; margin-top:14px; font-size:13.5px; }
+  .panel summary { cursor:pointer; color:var(--muted); font-weight:600;
+                  display:flex; align-items:center; gap:8px; }
+  summary #pdfpack { margin-left:auto; font-weight:400; flex:none; }
+  .panel summary:hover { color:var(--fg); }
+  .panel input[type=text] { background:var(--field); }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; margin:14px 0 2px; }
+  .chip { padding:3px 10px; border-radius:999px; font-size:12px; border:1px solid var(--line2);
+          font-variant-numeric:tabular-nums; }
+  .chip.good { color:var(--good); border-color:rgba(62,207,142,.4); }
+  .chip.bad  { color:var(--bad); border-color:rgba(255,107,107,.4); }
+  .chip.warn { color:var(--warn); border-color:rgba(245,185,66,.4); }
+  .chip.info { color:var(--muted); }
+  .claim { border-left:3px solid var(--line2); padding:4px 10px; margin:6px 0; background:var(--sunk); }
+  .retract { margin:3px 0; padding:3px 8px; border-radius:6px; font-size:12px; color:var(--bad);
+             background:rgba(255,107,107,.12); border:1px solid rgba(255,107,107,.4); }
+  .retract a { color:var(--bad); }
+  .srow { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-top:8px;
+          padding-top:8px; border-top:1px dashed var(--line); font-size:12px; }
+  .srow .slab { color:var(--muted); }
+  .sbtn { padding:2px 9px; border-radius:6px; font-size:11px; cursor:pointer;
+          background:transparent; border:1px solid var(--line2); color:var(--muted); }
+  .sbtn:hover { border-color:var(--accent); color:var(--fg); }
+  .sbtn.on.include { color:var(--good); border-color:rgba(62,207,142,.6); background:rgba(62,207,142,.14); }
+  .sbtn.on.exclude { color:var(--bad); border-color:rgba(255,107,107,.6); background:rgba(255,107,107,.14); }
+  .sbtn.on.maybe { color:var(--warn); border-color:rgba(245,185,66,.6); background:rgba(245,185,66,.14); }
+  .sreason, .snote { font-size:11px; padding:3px 6px; border-radius:6px;
+                     border:1px solid var(--line2); background:var(--sunk); color:var(--fg); }
+  .snote { width:190px; }
+  .srow[data-decision="include"] { border-left:3px solid rgba(62,207,142,.55); padding-left:8px; }
+  .srow[data-decision="exclude"] { border-left:3px solid rgba(255,107,107,.55); padding-left:8px; }
+  .srow[data-decision="maybe"] { border-left:3px solid rgba(245,185,66,.55); padding-left:8px; }
+  .cla { padding:1px 7px; border-radius:999px; font-size:11px; color:var(--warn);
+         border:1px solid rgba(245,185,66,.45); margin-left:6px; white-space:nowrap; }
+  .evrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+  .evscore { padding:2px 10px; border-radius:999px; font-size:12px; border:1px solid var(--line2); }
+  .evscore.good { color:var(--good); border-color:rgba(62,207,142,.5); background:rgba(62,207,142,.12); }
+  .evscore.warn { color:var(--warn); border-color:rgba(245,185,66,.5); background:rgba(245,185,66,.12); }
+  .evscore.bad  { color:var(--bad); border-color:rgba(255,107,107,.5); background:rgba(255,107,107,.12); }
+  .evscore.info { color:var(--muted); }
+  table.dims td { vertical-align:middle; }
+  table.dims td.good { color:var(--good); } table.dims td.warn { color:var(--warn); } table.dims td.bad { color:var(--bad); }
+  .dbar { height:5px; border-radius:3px; background:var(--line2); min-width:2px; }
+  .dbar.good { background:var(--good); } .dbar.warn { background:var(--warn); } .dbar.bad { background:var(--bad); }
+  input[type=range] { width:160px; accent-color:var(--accent); }
+  .claim.unsup { border-color:var(--bad); }
+  .claim.sup { border-color:var(--good); }
+  .meta { color:var(--muted); font-size:12.5px; font-variant-numeric:tabular-nums; }
+  #runhint { margin-top:6px; }
+  .evidence { margin-top:6px; }
+  .evidence summary { font-size:12px; color:var(--muted); cursor:pointer; }
+  .snip { display:block; border-left:2px solid var(--line2); margin:6px 0 6px 2px; padding:2px 0 2px 8px; }
+  .evsrc { display:block; color:var(--muted); font-size:12px; margin-bottom:3px; }
+  .evsnip { display:block; margin:4px 0; padding:6px 8px; background:var(--field); border-radius:6px;
+            font-size:12px; color:var(--body); white-space:pre-wrap; }
+  .snip a { color:var(--accent); }
+  .evwrap { display:inline; }
+  .evbtn { padding:0 7px; margin-left:5px; font-size:11px; line-height:18px; border-radius:999px;
+           border:1px solid rgba(62,207,142,.45); background:transparent; color:var(--good);
+           cursor:pointer; vertical-align:baseline; font-family:inherit; }
+  .evbtn.bad { border-color:rgba(255,107,107,.45); color:var(--bad); }
+  .evbtn:hover { background:var(--hover); }
+  .evbody { display:block; margin:5px 0 8px; }
+  .evbody[hidden] { display:none; }
+  .badge { display:inline-block; padding:0 7px; margin:0 4px 0 0; font-size:11px; line-height:18px;
+           border-radius:999px; border:1px solid var(--line2); color:var(--muted); vertical-align:baseline;
+           cursor:default; }
+  .badge.cross { color:var(--accent); border-color:rgba(124,196,255,.45); }
+  .badge.ft    { color:var(--good); border-color:rgba(62,207,142,.45); }
+  .badge.abs   { color:var(--warn); border-color:rgba(245,185,66,.45); }
+  .badge.unk   { color:var(--muted); }
+  .badge.uns   { color:var(--bad); border-color:rgba(255,107,107,.45); }
+  .paper { border-top:1px solid var(--line); padding:9px 0; border-radius:8px;
+           transition:background .12s; }
+  .paper:hover { background:var(--hover); }
+  .paper strong { color:var(--strong); font-size:15px; }
+  .paper .links a { margin-right:10px; font-size:12px; }
+  .gbar { height:4px; background:var(--accent); border-radius:2px; margin-top:3px; opacity:.75; }
+  .gt { color:var(--body); font-size:12px; }
+  #graphpanel table.stats td { vertical-align:top; }
+  table.stats { border-collapse:collapse; width:100%; font-size:12.5px; font-variant-numeric:tabular-nums; }
+  table.stats td, table.stats th { border:1px solid var(--line); padding:4px 8px; text-align:left; }
+  .histitem { display:flex; gap:10px; align-items:center; border-bottom:1px solid var(--line);
+              padding:7px 2px; font-size:13.5px; }
+  .histitem button { padding:4px 10px; font-size:12px; }
+  /* 追问对话：气泡 + 输入行；与论文卡片同处一张卡片里，视觉上属于本次结果 */
+  #chatlog { display:flex; flex-direction:column; gap:9px; margin:8px 0 10px; }
+  #chatlog:empty { display:none; }
+  .cmsg { border:1px solid var(--line); border-radius:11px; padding:8px 11px;
+          font-size:13.5px; line-height:1.65; }
+  .cmsg p { margin:7px 0; }
+  .cmsg p:first-child { margin-top:0; }
+  .cmsg p:last-child { margin-bottom:0; }
+  .cmsg.user { background:var(--sunk); color:var(--body); }
+  .cmsg .cwho { font-size:11.5px; color:var(--muted); margin-bottom:3px; }
+  .cmsg .cmeta { font-size:11.5px; color:var(--muted); margin-top:6px;
+                 display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; }
+  .cmsg .cok { color:var(--good); }
+  .cmsg .cerr { color:var(--bad); }
+  .cmsg .newsearch { border-top:1px dashed var(--line); padding-top:6px; }
+  .chatbox { display:flex; gap:8px; align-items:stretch; }
+  #chatin { flex:1; min-height:46px; padding:10px 12px; resize:vertical;
+            background:var(--field); color:var(--fg); border:1px solid var(--line2);
+            border-radius:10px; font-family:inherit; font-size:13.5px; line-height:1.6; }
+  #chatin:focus { outline:none; border-color:var(--accent); }
+  #chatsend { padding:0 16px; flex:none; }
+  .chatopt { display:flex; align-items:center; gap:6px; margin-top:7px;
+             color:var(--muted); font-size:12.5px; cursor:pointer; }
+  .chatopt input { width:14px; height:14px; flex:none; }
+  .cmeta.fetched { color:var(--body); border-left:2px solid var(--accent);
+                   padding-left:9px; margin-top:6px; }
+  .chatex { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chatex button { padding:4px 10px; font-size:12px; font-weight:400; background:transparent;
+                   color:var(--muted); border:1px solid var(--line2); border-radius:999px; }
+  .chatex button:hover { color:var(--fg); border-color:var(--accent); filter:none; }
+  /* 领域探索：方向卡片 */
+  #exppath:empty { display:none; }
+  #exppath { margin:6px 0 4px; }
+  #expdirs { display:flex; flex-direction:column; gap:8px; margin:8px 0 10px; }
+  .dircard { border:1px solid var(--line); border-radius:10px; padding:10px 12px;
+             background:var(--sunk); }
+  .dircard.on { border-color:var(--accent); background:var(--hover); }
+  .dirhead { display:flex; align-items:center; gap:10px; }
+  .dirhead label { flex:1; display:flex; align-items:baseline; gap:8px; cursor:pointer; }
+  .dirhead input { width:15px; height:15px; flex:none; }
+  .diren { color:var(--muted); font-size:12.5px; font-weight:400; }
+  .dirwhy { margin:5px 0 0 23px; color:var(--body); font-size:13.5px; }
+  .dirq { margin:4px 0 0 23px; color:var(--muted); font-size:12px;
+          font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .dirrefs { margin:6px 0 0 23px; padding-left:16px; color:var(--body); font-size:12.5px; }
+  .dirrefs li { margin:2px 0; }
+  .dirrefs a { color:var(--fg); text-decoration:none; border-bottom:1px dotted var(--line2); }
+  .dirrefs a:hover { color:var(--accent); }
+  .expbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+            border-top:1px solid var(--line); padding-top:10px; }
+  .explog { margin-top:10px; }
+  .explog .exstep { border-left:2px solid var(--line2); padding:2px 0 2px 10px;
+                    margin:6px 0; color:var(--body); font-size:12.5px; }
+  .histwrap { border-bottom:1px solid var(--line); }
+  .histwrap .histitem { border-bottom:0; }
+  .hexp { display:flex; flex-wrap:wrap; gap:6px; padding:0 0 10px 2px; }
+  .hexp:empty { display:none; }
+  .error { color:var(--bad); }
+  details { margin-top:6px; }
+  #history { margin-top:24px; }
+  #history > summary { display:flex; align-items:center; gap:8px; }
+  #history > summary .meta { font-weight:400; }
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--line2);
+             border-top-color:var(--accent); border-radius:50%;
+             animation:spin .8s linear infinite; vertical-align:-2px; margin-right:8px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  /* 扫读：摘要默认只占三行，点一下展开（一篇篇读不动的长摘要不再刷屏） */
+  .abs { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical;
+         overflow:hidden; cursor:pointer; }
+  .abs:hover { color:var(--fg); }
+  .abs.open { display:block; overflow:visible; }
+  .empty { color:var(--muted); font-size:13.5px; margin-top:18px; }
+  .empty .ex { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .empty .ex button { padding:6px 12px; font-size:12px; font-weight:400; background:transparent;
+                      color:var(--muted); border:1px solid var(--line2); border-radius:999px; }
+  .empty .ex button:hover { color:var(--fg); border-color:var(--accent); filter:none; }
+  #totop { position:fixed; right:22px; bottom:24px; width:36px; height:36px; padding:0;
+           border-radius:50%; background:var(--card); border:1px solid var(--line2);
+           color:var(--muted); font-size:15px; font-weight:400;
+           opacity:0; pointer-events:none; transition:opacity .18s; }
+  #totop.show { opacity:1; pointer-events:auto; }
+  #totop:hover { color:var(--fg); border-color:var(--accent); }
+  @media (max-width:720px) {
+    main { padding:32px 14px 72px; }
+    h1 { font-size:30px; margin:10px 0 22px; }
+    #theme { top:14px; right:14px; }
+    form { flex-wrap:wrap; }
+    form button { width:100%; }
+    .optrow { gap:8px 12px; }
+    .panel { padding:10px 12px; }
+    #answerbox { font-size:14px; }
+    table.stats { display:block; overflow-x:auto; white-space:nowrap; }
+    .histitem { align-items:flex-start; }
+  }
+  /* 打印 / 存 PDF 精读：去掉交互件、白底黑字、卡片不跨页断开 */
+  @media print {
+    :root { --bg:#fff; --card:#fff; --field:#fff; --sunk:#fafafa; --line:#ccc; --line2:#ccc;
+            --fg:#000; --strong:#000; --body:#000; --muted:#555; --hover:transparent; }
+    .controls, form, #progress, .bar, #chips, #totop, #history, #log,
+    .srow, .evbtn, .empty, #chatpanel { display:none !important; }
+    main { max-width:none; padding:0; min-height:0; display:block; }
+    #answerbox p, #answerbox li, .claim { max-width:none; }
+    .panel, .paper { break-inside:avoid; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <button type="button" id="theme" class="ghost mini" title="深色 / 浅色主题（浅色适合白天阅读与投影；打印自动白底黑字）">🌗 浅色</button>
+  <h1>📚 Scholar<span class="brand2">Mate</span></h1>
+  <form id="form">
+    <input id="q" type="text" placeholder="输入研究问题或论文关键词，例如：如何减少大语言模型在医疗问答中的幻觉？" required>
+    <button id="btn" type="submit">提问</button>
+    <button type="button" id="stop" style="display:none" title="按请求停止：在当前步骤收尾处中断，已完成阶段的断点会保留">⏹ 停止</button>
+  </form>
+  <div id="progress"><span class="spinner"></span><span id="stage">启动…</span>
+    <div class="meta" id="runhint">运行中修改上面的设置只对<b>下一次</b>提问生效；想立刻改，点「⏹ 停止」中断本次运行。</div>
+  </div>
+  <section class="controls">
+    <div class="modes">
+      <label class="mode"><input type="radio" name="mode" value="ask" checked> 🤖 智能问答</label>
+      <label class="mode"><input type="radio" name="mode" value="search"> 📄 仅搜索论文</label>
+      <label class="mode" title="给一个领域，ScholarMate 先拆成若干可调研的方向，你逐层选下去或直接要一份综述报告"><input type="radio" name="mode" value="explore"> 🔭 领域探索</label>
+    </div>
+    <div class="optrow" id="sorts">
+      <label>排序方式</label>
+      <select id="sort">
+        <option value="relevance">相关性（默认）</option>
+        <option value="year_desc">发表时间 · 近 → 远</option>
+        <option value="year_asc">发表时间 · 远 → 近</option>
+        <option value="cited_desc">被引量 · 高 → 低</option>
+        <option value="cited_asc">被引量 · 低 → 高</option>
+        <option value="title_asc">标题 · A → Z</option>
+      </select>
+    </div>
+    <div class="optrow">
+      <label>时间范围</label>
+      <select id="window">
+        <option value="any">不限年份</option>
+        <option value="y1">近 1 年</option>
+        <option value="y3">近 3 年</option>
+        <option value="y5">近 5 年</option>
+      </select>
+      <label><input type="checkbox" id="review"> 仅综述（Survey / Review）</label>
+      <label id="retractionopt" style="display:none" title="仅检索模式默认跳过（省约 13s）；勾选后会逐篇核对 OpenAlex / Crossref 的撤稿状态"><input type="checkbox" id="retraction"> 🚫 撤稿筛查（较慢）</label>
+      <label>限定期刊/会议</label>
+      <input id="venue" type="text" style="flex:none;width:210px" placeholder="如 arXiv / Springer / NeurIPS" value="">
+    </div>
+    <div class="optrow" id="tierrow">
+      <label style="cursor:default" title="勾选后只保留对应级别的刊物；不勾选 = 不限">🏷 刊物层级</label>
+      <label title="旗舰主刊本身：Nature / Science / Cell / NEJM / The Lancet / JAMA / BMJ / PNAS">
+        <input type="checkbox" class="tier" value="flagship"> 正刊</label>
+      <label title="上述刊物的系列刊：Nature Communications、Science Advances、Cell Reports、JAMA Network Open、BMJ Open 等">
+        <input type="checkbox" class="tier" value="sub"> 子刊</label>
+      <label title="一区：分区由本地表 + OpenAlex 期刊影响力（2 年平均被引）估算，不是官方分区；把官方分区表放进 outputs/journal_tiers.json 即生效"><input type="checkbox" class="tier" value="q1"> 一区</label>
+      <label title="二区：分区由本地表 + OpenAlex 期刊影响力（2 年平均被引）估算，不是官方分区；把官方分区表放进 outputs/journal_tiers.json 即生效"><input type="checkbox" class="tier" value="q2"> 二区</label>
+      <label title="三区：分区由本地表 + OpenAlex 期刊影响力（2 年平均被引）估算，不是官方分区；把官方分区表放进 outputs/journal_tiers.json 即生效"><input type="checkbox" class="tier" value="q3"> 三区</label>
+      <label title="四区：分区由本地表 + OpenAlex 期刊影响力（2 年平均被引）估算，不是官方分区；把官方分区表放进 outputs/journal_tiers.json 即生效"><input type="checkbox" class="tier" value="q4"> 四区</label>
+      <label title="默认只保留勾选的层级。勾上它，会议论文、预印本以及查不到层级数据的刊物也一起保留（检索召回更高，但不再保证层级）">
+        <input type="checkbox" id="keepothers"> 保留会议/预印本/未分类</label>
+      <span class="meta" id="tierhint" title="分区由本地表 + OpenAlex 期刊影响力（2 年平均被引）估算，不是官方分区；把官方分区表放进 outputs/journal_tiers.json 即生效">ⓘ 分区为估算，可换成官方分区表</span>
+    </div>
+    <div class="optrow" id="scoreopts">
+      <label title="关闭后跳过逐句全文校验，回答更快，但不会有声明级证据与证据强度徽标"><input type="checkbox" id="deepverify" checked> 🔍 逐句全文校验（较慢）</label>
+      <label title="按 10 个维度打分并按你设定的权重合成总分"><input type="checkbox" id="scoreevidence"> ⚖️ 证据评分（10 维度加权）</label>
+      <button type="button" id="scoretoggle" class="ghost mini">调整维度权重</button>
+    </div>
+  </section>
+  <details class="panel" id="scoringpanel" hidden>
+    <summary>⚖️ 证据评分权重（拖动滑杆即时保存，下次运行生效）</summary>
+    <div id="scoringbody" class="meta">读取中…</div>
+  </details>
+  <div class="bar" id="toolbar"></div>
+  <div id="chips" class="chips"></div>
+  <div id="answer"></div>
+  <div id="empty" class="empty">输入研究问题或关键词开始检索，也可以直接试一条：
+    <div class="ex">
+      <button type="button" class="qex" data-q="如何减少大语言模型在医疗问答中的幻觉？">LLM 医疗问答幻觉</button>
+      <button type="button" class="qex" data-q="time-restricted eating and insulin sensitivity">限时进食与胰岛素敏感性</button>
+      <button type="button" class="qex" data-q="single-cell RNA-seq batch effect correction">单细胞测序批次效应</button>
+      <button type="button" class="qex" data-q="CRISPR off-target prediction methods">CRISPR 脱靶预测</button>
+    </div>
+    <div class="meta" style="margin-top:8px">快捷键：/ 聚焦输入框 · Esc 清空 · Enter 提交 · Ctrl/⌘ + Enter 任意位置提交</div>
+  </div>
+  <pre id="log" style="display:none"></pre>
+  <div id="ownerbar" class="panel" style="display:none;margin-bottom:14px"></div>
+  <details class="panel" id="history"><summary>🕘 历史记录<span class="meta" id="histcount"></span></summary><div id="histlist" class="meta">展开后加载（仅显示本浏览器的记录）…</div></details>
+</main>
+<button type="button" id="totop" title="回到顶部">↑</button>
+<script>
+const $ = id => document.getElementById(id);
+const form = $("form"), q = $("q"), btn = $("btn"), logBox = $("log");
+const answerBox = $("answer"), stage = $("stage"), progress = $("progress");
+const chips = $("chips"), toolbar = $("toolbar");
+let current = null;      // last completed result payload (for local re-sorting)
+let relevancePending = false;
+let currentJobId = null; // job the ⏹ button would stop ("/cancel" target)
+
+function setRunning(on) {
+  const stop = $("stop");
+  if (stop) {
+    stop.style.display = on ? "" : "none";
+    stop.disabled = false;
+    stop.textContent = "⏹ 停止";
+  }
+}
+
+async function stopRun() {
+  if (!currentJobId) return;
+  const stop = $("stop");
+  stop.disabled = true;
+  stop.textContent = "停止中…";
+  try {
+    const r = await fetch("/cancel", {method: "POST", headers: {"Content-Type": "application/json"},
+                                      body: JSON.stringify({id: currentJobId})});
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    stage.textContent = "⏹ 正在停止（等当前这一步收尾）…";
+  } catch (e) {
+    flashMsg("停止失败：" + (e.message || e));
+    stop.disabled = false;
+    stop.textContent = "⏹ 停止";
+  }
+}
+
+function syncMode() {
+  const mode = document.querySelector('input[name="mode"]:checked').value;
+  // the radios themselves are visually hidden: highlight the chosen segment
+  document.querySelectorAll('input[name="mode"]').forEach(r => {
+    const lab = r.closest("label");
+    if (lab) lab.classList.toggle("active", r.checked);
+  });
+  $("sorts").classList.toggle("visible", mode === "search");
+  // exploration reads a field, not a question: none of the per-run switches
+  // below apply until the report itself is generated
+  if (mode === "explore") {
+    $("scoreopts").style.display = "none";
+    $("retractionopt").style.display = "none";
+    btn.textContent = "探索";
+    return;
+  }
+  // the whole row is answer-only: full-text sentence check + evidence scoring
+  const scoreOpts = $("scoreopts");
+  if (scoreOpts) scoreOpts.style.display = (mode === "ask") ? "" : "none";
+  // retraction screening is a per-search choice; answers always screen
+  const rOpt = $("retractionopt");
+  if (rOpt) rOpt.style.display = (mode === "search") ? "" : "none";
+  if (mode !== "ask") {
+    $("scoreevidence").checked = false;
+    const panel = $("scoringpanel");
+    if (panel) panel.hidden = true;
+  }
+  btn.textContent = mode === "search" ? "检索" : "提问";
+}
+document.querySelectorAll('input[name="mode"]').forEach(r => r.addEventListener("change", syncMode));
+
+syncMode();
+$("stop").addEventListener("click", stopRun);
+
+// 折叠只是为了屏幕上的简洁：打印/导出时把内容展开，别让参考文献印不出来
+window.addEventListener("beforeprint", () => {
+  document.querySelectorAll("details").forEach(d => {
+    if (!d.open) { d.dataset.folded = "1"; d.open = true; }
+  });
+});
+window.addEventListener("afterprint", () => {
+  document.querySelectorAll("details[data-folded]").forEach(d => {
+    d.open = false; delete d.dataset.folded;
+  });
+});
+
+document.addEventListener("click", (e) => {
+  const cite = e.target && e.target.closest ? e.target.closest("a.cite") : null;
+  if (cite) {
+    e.preventDefault();
+    revealPaper((cite.getAttribute("href") || "").slice(1));
+    return;
+  }
+  const t = e.target;
+  if (!t || !t.closest) return;
+  // while a reader is selecting abstract text to copy, don't fold the abstract
+  const selecting = window.getSelection && String(window.getSelection()).length > 0;
+  const abs = t.closest(".abs");
+  if (abs && !selecting) { abs.classList.toggle("open"); return; }
+  const ex = t.closest(".qex");
+  if (ex) { q.value = ex.getAttribute("data-q") || ""; q.focus(); return; }
+  if (t.closest("#totop")) { window.scrollTo({top:0, behavior:"smooth"}); return; }
+  const b = t.closest(".evbtn");
+  if (!b) return;
+  const body = b.parentElement ? b.parentElement.querySelector(".evbody") : null;
+  if (body) body.hidden = !body.hidden;
+});
+
+$("sort").addEventListener("change", () => {
+  // re-order the ALREADY fetched papers instantly; no new search is triggered
+  if (current && current.mode === "search" && !btn.disabled) applyLocalSort();
+});
+
+function hasEvidenceScores(data) {
+  return !!(data && data.evidence && data.evidence.scored);
+}
+q.addEventListener("input", () => {
+  if (current && q.value.trim() !== current.question) current = null;
+});
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+function attr(s) {   // esc() for values placed inside an HTML attribute
+  return esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function frag(s) { return '<span class="' + s + '">'; }
+
+function findClaimSpan(out, t, cursor) {
+  // exact match first (the splitter is told to keep the wording);
+  let idx = out.indexOf(t, cursor);
+  if (idx >= 0) return [idx, t.length];
+  idx = out.indexOf(t);
+  if (idx >= 0) return [idx, t.length];
+  // the splitter sometimes prepends the section title to a claim; try
+  // dropping leading words until the remainder matches verbatim
+  const words = t.split(/\\s+/);
+  for (let k = 1; k <= Math.min(12, words.length - 3); k++) {
+    const cand = words.slice(k).join(" ");
+    if (cand.length < 24) break;
+    let h = out.indexOf(cand, cursor);
+    if (h < 0) h = out.indexOf(cand);
+    if (h >= 0) return [h, cand.length];
+  }
+  // otherwise fall back to the longest prefix that still appears, so a claim
+  // whose wording drifted (or that swallowed a section heading) still anchors
+  const max = Math.min(t.length, 120);
+  for (let L = max - 1; L >= 24; L--) {
+    const head = t.slice(0, L);
+    let h = out.indexOf(head, cursor);
+    if (h < 0) h = out.indexOf(head);
+    if (h >= 0) return [h, L];
+  }
+  return null;
+}
+
+function annotate(md, claims) {
+  let out = md, cursor = 0;
+  for (let i = 0; i < claims.length; i++) {
+    const cl = claims[i] || {};
+    const t = (cl.text || "").trim();
+    if (t.length < 8) continue;
+    const span = findClaimSpan(out, t, cursor);
+    if (!span) continue;
+    const idx = span[0], end = span[0] + span[1];
+    const ins = "\\uE002" + i + "\\uE003";
+    if (cl.supported === false) {
+      out = out.slice(0, idx) + "\\uE000" + out.slice(idx, end) + "\\uE001" + ins + out.slice(end);
+    } else {
+      out = out.slice(0, end) + ins + out.slice(end);
+    }
+    cursor = end + ins.length;
+  }
+  return out;
+}
+
+// The answer ends with a reference list that is long and rarely read inline
+// (the [n] links already go to the paper cards), so it is folded into a
+// <details>. The heading is the same two families verify.py splits on.
+const REF_HEADING = /^[#>*_\\s]*(参考文献|引文|文献列表|References)[\\s*_:：]*(（[^）]*）|\\([^)]*\\))?\\s*$/im;
+
+function splitRefs(md) {
+  const text = md || "";
+  const m = REF_HEADING.exec(text);
+  if (!m) return {body: text, refs: ""};
+  return {body: text.slice(0, m.index), refs: text.slice(m.index + m[0].length)};
+}
+
+function mdToHTML(text, claims) {
+  let s = esc(annotate(text || "", claims || []));
+  s = s.replace(/\\uE000/g, '<mark class="unsup">').replace(/\\uE001/g, "</mark>");
+  s = s.replace(/\\*\\*(.+?)\\*\\*/g, "<strong>$1</strong>");
+  s = s.replace(/\\[(\\d+)\\]/g, '<a class="cite" href="#cite-$1">[$1]</a>');
+  s = s.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+  s = s.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+  s = s.replace(/^# (.+)$/gm, "<h2>$1</h2>");
+  s = s.replace(/\\uE002(\\d+)\\uE003/g, function (m, i) {
+    try { return evInlineHTML((claims || [])[Number(i)]); } catch (err) { return ""; }
+  });
+  return s.split(/\\n{2,}/).map(p => p.trim() ? "<p>" + p.replace(/\\n/g,"<br>") + "</p>" : "").join("");
+}
+
+function render(md, claims) {
+  const sp = splitRefs(md);
+  const html = mdToHTML(sp.body, claims || []);
+  if (!sp.refs.trim()) return html;
+  const n = (sp.refs.match(/^\\s*\\[(\\d+)\\]/gm) || []).length;
+  return html +
+    '<details class="refs"><summary>📑 参考文献' +
+    (n ? "（" + n + " 条）" : "") + " · 点击展开</summary>" +
+    mdToHTML(sp.refs, []) + "</details>";
+}
+
+function download(name, content, mime) {
+  const blob = new Blob([content], {type: mime || "text/plain;charset=utf-8"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+// a .docx is a zip of XML parts: the server sends it base64-encoded, so it has
+// to be decoded back into bytes before the browser can save it
+function downloadB64(name, b64, mime) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const blob = new Blob([bytes], {type: mime || "application/octet-stream"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function flashMsg(text) {
+  stage.textContent = text;
+  progress.classList.add("visible");
+  setTimeout(() => progress.classList.remove("visible"), 3000);
+}
+
+async function fetchExportsById(id, only, order) {
+  const body = {id: id, order: order || []};
+  if (only) body.only = only;
+  try {
+    const resp = await fetch("/export", {method:"POST", headers:{"Content-Type":"application/json"},
+                                         body: JSON.stringify(body)});
+    const j = await resp.json();
+    return (j && j.ok) ? j : null;
+  } catch (e) { return null; }
+}
+
+async function fetchExportsInOrder(only) {
+  if (!current || !current.papers.length) return null;
+  return fetchExportsById(current.id, only, current.papers.map(p => p.title));
+}
+
+async function exportCurrent(kind, name, mime, only) {
+  if (!current) return;
+  const j = await fetchExportsInOrder(only);
+  if (!j || !j[kind]) { flashMsg(only ? "没有符合该筛选条件的文献" : "导出失败：未能按当前顺序生成"); return; }
+  download(name, j[kind], mime);
+  flashMsg(only ? ("已导出 " + j.count + " 篇（筛选后）") : ("已按当前显示顺序导出 " + current.papers.length + " 篇"));
+}
+
+async function exportPrisma() {
+  if (!current) return;
+  const j = await fetchExportsInOrder();
+  if (!j || !j.prisma_csv) { flashMsg("PRISMA 台账生成失败"); return; }
+  download("scholarmate-" + current.id + "-prisma.csv", j.prisma_csv, "text/csv;charset=utf-8");
+  flashMsg("已导出 PRISMA 筛选表（" + (j.screening_total || current.papers.length) + " 篇的筛选决定与理由）");
+}
+
+async function exportEvidence() {
+  if (!current) return;
+  if (!hasEvidenceScores(current)) { flashMsg("本次运行未启用证据评分"); return; }
+  const j = await fetchExportsInOrder();
+  if (!j || !j.evidence_csv) { flashMsg("证据评分表生成失败"); return; }
+  download("scholarmate-" + current.id + "-evidence.csv", j.evidence_csv, "text/csv;charset=utf-8");
+  flashMsg("已导出证据评分表（10 维度明细 + 总分 + 等级）");
+}
+
+async function exportPrismaMd() {
+  if (!current) return;
+  const j = await fetchExportsInOrder();
+  if (!j || !j.prisma_md) { flashMsg("筛选台账生成失败"); return; }
+  download("scholarmate-" + current.id + "-prisma.md", j.prisma_md, "text/markdown;charset=utf-8");
+  flashMsg("已导出筛选台账（Markdown，可直接粘进论文方法部分）");
+}
+
+// 批量下载：把这次回答附上的文献里可公开获取的 PDF 打成一个 ZIP。
+// 服务端同步打包（有墙钟上限），所以这里给按钮挂一个已用秒数，免得看着像卡死。
+async function downloadPdfPack(btn) {
+  if (!current || !current.papers.length) return;
+  const label = btn ? btn.textContent : "";
+  const t0 = Date.now();
+  let timer = null;
+  const tick = () => {
+    if (btn) btn.textContent = "⏳ 获取开放 PDF 并打包… " + Math.round((Date.now() - t0) / 1000) + "s";
+  };
+  if (btn) { btn.disabled = true; tick(); timer = setInterval(tick, 1000); }
+  try {
+    const resp = await fetch("/pdfpack", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({id: current.id, order: current.papers.map(p => p.title)})});
+    if (!resp.ok) { flashMsg("打包失败：没有可用的检索结果"); return; }
+    const blob = await resp.blob();
+    downloadBlob("scholarmate-" + current.id + "-pdfs.zip", blob);
+    const got = resp.headers.get("X-Pdf-Count"), all = resp.headers.get("X-Paper-Count");
+    flashMsg("已打包 " + (got === null ? "?" : got) + "/" + (all === null ? current.papers.length : all) +
+             " 篇开放 PDF（付费墙文献未包含，清单与原因见 ZIP 内 download-report.txt）");
+  } catch (e) {
+    flashMsg("打包失败：" + (e && e.message ? e.message : e));
+  } finally {
+    if (timer) clearInterval(timer);
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+  }
+}
+
+function downloadBlob(name, blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------- 追问对话（交互模块）
+// 只在本次工作论文集内作答：不重新检索、不改变引用编号。这几条示例覆盖了
+// 读者看到一批文献后最常问的四种问题，点一下只填入输入框，仍由用户决定发送。
+const CHAT_EXAMPLES = [
+  "这几篇里哪一篇的实验证据最直接？为什么？",
+  "把这批文献的方法按类型分组，各给一两句概括",
+  "这批文献的共同局限和尚未解决的问题是什么？",
+  "帮我写一段可直接用于综述的引言（带引用）",
+];
+let CHAT = [];       // 本次运行已发生的对话（服务端记录，刷新后仍在）
+let chatJob = null;  // 正在回答的追问任务 id（同一时刻只允许一轮）
+
+function chatBubbleHTML(m) {
+  if (m.role === "user") {
+    return '<div class="cmsg user"><div class="cwho">你</div>' + esc(m.content) + "</div>";
+  }
+  const c = m.counts || {};
+  const meta = [];
+  if (c.ok || c.warn || c.bad) {
+    meta.push('<span class="' + (c.bad ? "cerr" : "cok") + '">引用校验：通过 ' + (c.ok || 0) +
+      (c.warn ? " ｜ 告警 " + c.warn : "") + (c.bad ? " ｜ 失败 " + c.bad : "") + "</span>");
+  }
+  if (m.duration_s) meta.push('<span>' + m.duration_s + "s</span>");
+  let extra = "";
+  if (c.bad && (m.audit || {}).items) {
+    const bad = (m.audit.items || []).filter(i => i.status !== "ok")
+      .map(i => esc(i.message)).join("<br>");
+    if (bad) extra = '<div class="cmeta cerr">' + bad + "</div>";
+  }
+  const fetched = m.fetched || [];
+  if (fetched.length) {
+    const bits = fetched.map(f => '<code>' + esc(f.query || "") + "</code> → 新增 " +
+      (f.added || 0) + " 篇" + (f.titles && f.titles.length
+        ? "：" + esc(f.titles.slice(0, 3).map(t => t.length > 46 ? t.slice(0, 46) + "…" : t).join("；")) : "")).join("<br>");
+    extra += '<div class="cmeta fetched">🔎 本轮自动补检索<br>' + bits + "</div>";
+  }
+  if (m.needs_new_search) {
+    extra += '<div class="cmeta newsearch">' +
+      (m.papers_added ? "🔎 补检索后材料仍不足" : "🔎 现有论文里信息不足，需要补充检索") +
+      (m.search_query ? '（建议检索词：<code>' + esc(m.search_query) + "</code>）" : "") +
+      ' <button type="button" class="ghost mini" data-search="' + attr(m.search_query || "") +
+      '" onclick="reuseSearch(this)">开一次完整检索</button></div>';
+  }
+  return '<div class="cmsg bot"><div class="cwho">ScholarMate</div>' +
+    render(m.content) + (meta.length ? '<div class="cmeta">' + meta.join("") + "</div>" : "") +
+    extra + "</div>";
+}
+
+function renderChatLog() {
+  const el = $("chatlog");
+  if (!el) return;
+  el.innerHTML = CHAT.map(chatBubbleHTML).join("");
+  const n = $("chatcount");
+  if (n) n.textContent = CHAT.length ? "｜已追问 " + CHAT.filter(m => m.role === "user").length + " 轮" : "";
+}
+
+function setChatHint(html) {
+  const el = $("chathint");
+  if (el) el.innerHTML = html;
+}
+
+async function sendChat() {
+  const box = $("chatin"), btn = $("chatsend");
+  if (!box || !btn || !current || chatJob) return;
+  const text = (box.value || "").trim();
+  if (!text) { box.focus(); return; }
+  box.value = "";
+  CHAT.push({role: "user", content: text});
+  renderChatLog();
+  btn.disabled = true; box.disabled = true;
+  setChatHint('⏳ ScholarMate 正在读这批论文作答… <button type="button" class="ghost mini" onclick="stopChat()">⏹ 停止</button>');
+  try {
+    const fetchBox = $("chatfetch");
+    const r = await fetch("/chat", {method: "POST", headers: {"Content-Type": "application/json"},
+                                    body: JSON.stringify({id: current.id, message: text,
+                                                          allow_retrieve: fetchBox ? !!fetchBox.checked : true})});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.id) throw new Error(j.error || "无法开始追问");
+    chatJob = j.id;
+    const st = await pollChat(j.id);
+    if (st.status === "done" && st.data && st.data.chat_turn) {
+      const turn = st.data.chat_turn;
+      CHAT.push(turn);
+      current.chat = CHAT;
+      if (turn.papers_added && st.data.chat_papers) {
+        // the conversation grew the working set: re-render so the paper cards,
+        // the [n] numbers and the export payloads all match the new list
+        current.papers = st.data.chat_papers;
+        renderAudits(current);
+        setChatHint("🔎 本轮自动补检索了 " + turn.papers_added + " 篇，已追加到下面的工作论文集（编号接着排，已有 [n] 不变）。");
+        const box = $("chatin");
+        if (box) box.focus();
+        return;
+      }
+      renderChatLog();
+      setChatHint(turn.needs_new_search
+        ? (turn.papers_added
+            ? "补检索过一轮仍没找到足够材料，已给出建议检索词——可以点「开一次完整检索」跑完整管线，或者换个问法。"
+            : "这批论文里没有相关信息。可以点「开一次完整检索」，或打开上面的「自动补检索」开关再问一次。")
+        : (turn.papers_added
+            ? "本轮的回答里用到了刚补检索的论文，新论文已编号追加（已有 [n] 不变）。"
+            : "在这批论文里就能答，未新增检索。"));
+    } else if (st.status === "cancelled") {
+      CHAT.pop();                       // 这一轮没有落盘，界面上也收回
+      renderChatLog();
+      setChatHint("已停止这一轮追问，可以改完再发一次。");
+    } else {
+      CHAT.pop();
+      renderChatLog();
+      setChatHint('<span class="cerr">追问失败：' + esc(st.error || st.stage || "未知错误") + "</span>");
+    }
+  } catch (e) {
+    CHAT.pop();
+    renderChatLog();
+    setChatHint('<span class="cerr">追问失败：' + esc(e && e.message ? e.message : e) + "</span>");
+  } finally {
+    chatJob = null;
+    if (btn) btn.disabled = false;
+    if (box) { box.disabled = false; box.focus(); }
+  }
+}
+
+async function pollChat(jid) {
+  for (;;) {
+    await new Promise(r => setTimeout(r, 1200));
+    let st;
+    try {
+      st = await (await fetch("/status?id=" + encodeURIComponent(jid))).json();
+    } catch (e) { return {status: "error", error: String(e)}; }
+    if (st.status === "running" || st.status === "queued") {
+      setChatHint('⏳ ' + (st.stage || "运行中…") +
+        ' <button type="button" class="ghost mini" onclick="stopChat()">⏹ 停止</button>');
+      continue;
+    }
+    return st;
+  }
+}
+
+async function stopChat() {
+  if (!chatJob) return;
+  try {
+    await fetch("/cancel", {method: "POST", headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({id: chatJob})});
+    setChatHint("正在停止…");
+  } catch (e) {}
+}
+
+// 追问里发现证据不够时，把建议检索词交给主检索流程（跑一次完整管线）
+function reuseSearch(btn) {
+  const text = (btn && btn.getAttribute("data-search")) || "";
+  if (!text) return;
+  q.value = text;
+  q.focus();
+  form.dispatchEvent(new Event("submit", {cancelable: true, bubbles: true}));
+}
+
+function wireChat(data) {
+  CHAT = Array.isArray(data.chat) ? data.chat.slice() : [];
+  renderChatLog();
+  const box = $("chatin"), btn = $("chatsend"), ex = $("chatex");
+  if (!box || !btn) return;
+  btn.addEventListener("click", sendChat);
+  box.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); sendChat(); }
+  });
+  if (ex) ex.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-ex]");
+    if (!b) return;
+    box.value = b.getAttribute("data-ex");
+    box.focus();
+  });
+}
+
+// <summary> 里的按钮必须先阻止默认行为，否则点一下会把面板收起
+function wirePdfPackBtn() {
+  const btn = $("pdfpack");
+  if (!btn) return;
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    downloadPdfPack(btn);
+  });
+}
+
+async function exportPapersCsv(only) {
+  if (!current) return;
+  const j = await fetchExportsInOrder(only);
+  if (!j || !j.papers_csv) { flashMsg(only ? "没有符合该筛选条件的文献" : "论文清单生成失败"); return; }
+  const tag = only ? "-included" : "";
+  download("scholarmate-" + current.id + "-papers" + tag + ".csv", j.papers_csv, "text/csv;charset=utf-8");
+  flashMsg("已导出论文清单 CSV（含摘要，" + j.count + " 篇，Excel 可直接打开）");
+}
+
+async function exportAnswerMd() {
+  if (!current) return;
+  const j = await fetchExportsInOrder();
+  if (!j || !j.answer_md) { flashMsg("本次运行没有可导出的回答"); return; }
+  download("scholarmate-" + current.id + "-answer.md", j.answer_md, "text/markdown;charset=utf-8");
+  flashMsg("已导出 Markdown 文档");
+}
+
+async function exportAnswerDocx() {
+  if (!current) return;
+  const j = await fetchExportsInOrder();
+  if (!j || !j.answer_docx) { flashMsg("本次运行没有可导出的回答"); return; }
+  downloadB64("scholarmate-" + current.id + "-answer.docx", j.answer_docx, DOCX_MIME);
+  flashMsg("已导出 Word 文档（.docx，可直接编辑）");
+}
+
+async function downloadSnapshot() {
+  if (!current) return;
+  const j = await fetchExportsInOrder();
+  const snap = Object.assign({}, current, {
+    exports: j ? {bibtex: j.bibtex, ris: j.ris, gbt: j.gbt, csl: j.csl} : (current.exports || {})
+  });
+  download("snapshot-" + current.id + ".json", JSON.stringify(snap), "application/json");
+  flashMsg("快照已按当前显示顺序保存");
+}
+
+function paperLinks(p, idx) {
+  const links = [];
+  if (p.doi) links.push('<a href="https://doi.org/' + encodeURIComponent(p.doi) + '" target="_blank">DOI</a>');
+  if (p.arxiv_id) links.push('<a href="https://arxiv.org/abs/' + encodeURIComponent(p.arxiv_id) + '" target="_blank">arXiv</a>');
+  if (p.pdf_url) links.push('<a href="' + esc(p.pdf_url) + '" target="_blank">PDF</a>');
+  if (p.url && p.url !== "https://doi.org/" + (p.doi || "")) links.push('<a href="' + esc(p.url) + '" target="_blank">来源页</a>');
+  if (window.BIBTEX && window.BIBTEX[idx]) links.push('<button class="ghost mini" onclick="download(\\'cite-' + (idx + 1) + '.bib\\', BIBTEX[' + idx + '], \\'text/x-bibtex\\')">BibTeX</button>');
+  links.push('<button class="ghost mini" onclick="copyPaperCitation(' + idx + ')">复制引用</button>');
+  return links.join("");
+}
+
+// copying is done through a hidden textarea when the page is served over plain
+// http (clipboard API needs a secure context, i.e. https / localhost)
+function copyText(text, label) {
+  const fallback = () => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      flashMsg(ok ? label + "已复制" : label + "复制失败，请手动选择文本");
+    } catch (e) { flashMsg(label + "复制失败，请手动选择文本"); }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => flashMsg(label + "已复制"), fallback);
+  } else fallback();
+}
+
+function copyPaperCitation(idx) {
+  const p = current && current.papers ? current.papers[idx] : null;
+  if (!p) return flashMsg("没有可复制的文献");
+  const cite = ((p.authors || []).join(", ") || "佚名") + " (" + (p.year || "n.d.") + "). " +
+    p.title + (p.venue ? ". " + p.venue : "") + (p.doi ? ". https://doi.org/" + p.doi : "");
+  copyText(cite, "引用");
+}
+
+function copyAnswerMarkdown() {
+  if (!current || !current.answer) return flashMsg("没有可复制的回答");
+  copyText("# " + (current.question || "") + "\\n\\n" + current.answer, "Markdown 回答");
+}
+
+// the example-question hints disappear as soon as a real run starts
+function setEmptyVisible(v) {
+  const el = $("empty");
+  if (el) el.style.display = v ? "" : "none";
+}
+
+function retractionHTML(p) {
+  if (!p.retracted) return "";
+  const notice = p.retraction_doi ? "https://doi.org/" + p.retraction_doi : "";
+  return "<div class=\'retract\'>🚫 该论文已被撤稿" + (p.retraction_note ? " · " + esc(p.retraction_note) : "") +
+    (notice ? " · <a href=\'" + esc(notice).replace(/\'/g, "%27") + "\' target=\'_blank\' rel=\'noopener\'>撤稿声明 ↗</a>" : "") +
+    "</div>";
+}
+
+// ------------------------------------------------------------ evidence scoring
+let SCORING = null;       // dimensions / presets / saved weights (GET /scoring)
+let scoringSaveTimer = null;
+
+function dimDefault(key) {
+  const d = ((SCORING || {}).dimensions || []).find(x => x.key === key);
+  return d ? d.default : 0;
+}
+
+function weightRowsHTML(weights) {
+  return ((SCORING || {}).dimensions || []).map(d => {
+    const w = (weights && weights[d.key] != null) ? weights[d.key] : d.default;
+    return '<tr><td><strong>' + esc(d.label) + '</strong><div class="meta">' + esc(d.hint) +
+      (d.direction < 0 ? ' · 风险维度（分数越高越差）' : '') + '</div></td>' +
+      '<td><input type="range" min="0" max="5" step="1" value="' + w + '" class="wslider" data-dim="' + attr(d.key) + '"></td>' +
+      '<td class="wval" data-dim="' + attr(d.key) + '" style="width:28px">' + w + '</td></tr>';
+  }).join("");
+}
+
+function renderScoringPanel(data) {
+  const box = $("scoringbody");
+  if (!box) return;
+  const presets = (data.presets || []).map(p =>
+    '<button type="button" class="ghost mini spreset" data-preset="' + attr(p.key) + '">' + esc(p.label) + '</button>').join(" ");
+  box.innerHTML =
+    '<div class="meta" style="margin-bottom:8px">总分 = 加权平均；风险维度按 (100 − 得分) 计入，所以总分始终「越高越好」。' +
+      '权重设为 0 即忽略该维度；一次运行最多评分 ' + (data.max_papers || 40) + ' 篇。</div>' +
+    '<div class="optrow" style="margin:0 0 6px"><span class="meta">预设：</span>' + presets + '</div>' +
+    '<div class="optrow" style="margin:0 0 10px"><label>目标物种</label>' +
+      '<input id="species" type="text" style="flex:none;width:200px" placeholder="如 human / mouse / 不限定" value="' +
+      attr(data.target_species || "") + '"><span class="meta">留空则「物种匹配」不计入总分</span></div>' +
+    '<table class="stats"><tr><th>维度（拖到 0 即忽略）</th><th style="width:180px">权重 0-5</th><th>值</th></tr>' +
+    weightRowsHTML(data.weights) + '</table>' +
+    '<div class="meta" id="scoringsave" style="margin-top:6px">权重会自动保存</div>';
+  wireScoringPanel();
+}
+
+function currentWeights() {
+  const out = {};
+  document.querySelectorAll(".wslider").forEach(s => { out[s.dataset.dim] = Number(s.value); });
+  return out;
+}
+
+function setSlider(key, value) {
+  const sl = document.querySelector('.wslider[data-dim="' + key + '"]');
+  if (!sl) return;
+  sl.value = value;
+  const cell = document.querySelector('.wval[data-dim="' + key + '"]');
+  if (cell) cell.textContent = value;
+}
+
+function scheduleScoringSave(preset) {
+  clearTimeout(scoringSaveTimer);
+  const note = $("scoringsave");
+  if (note) note.textContent = "保存中…";
+  scoringSaveTimer = setTimeout(async () => {
+    try {
+      const resp = await fetch("/scoring", {method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({weights: currentWeights(),
+                              target_species: ($("species") || {}).value || "",
+                              preset: preset || "custom"})});
+      const j = await resp.json();
+      if (!j.ok) throw new Error(j.error || "保存失败");
+      if (SCORING) { SCORING.weights = j.weights; SCORING.target_species = j.target_species; }
+      if (note) note.textContent = "✅ 已保存 · 下次运行生效";
+    } catch (err) {
+      if (note) note.textContent = "保存失败：" + (err.message || err);
+    }
+  }, 400);
+}
+
+function wireScoringPanel() {
+  document.querySelectorAll(".wslider").forEach(sl => {
+    sl.addEventListener("input", () => {
+      const cell = document.querySelector('.wval[data-dim="' + sl.dataset.dim + '"]');
+      if (cell) cell.textContent = sl.value;
+    });
+    sl.addEventListener("change", () => scheduleScoringSave(null));
+  });
+  document.querySelectorAll(".spreset").forEach(b => b.addEventListener("click", () => {
+    const preset = ((SCORING || {}).presets || []).find(p => p.key === b.dataset.preset);
+    if (!preset) return;
+    const named = Object.keys(preset.weights || {}).length > 0;   // {} = 回到维度默认
+    ((SCORING || {}).dimensions || []).forEach(d => {
+      const v = named ? (preset.weights[d.key] != null ? preset.weights[d.key] : 0) : d.default;
+      setSlider(d.key, v);
+    });
+    scheduleScoringSave(b.dataset.preset);
+  }));
+  const species = $("species");
+  if (species) species.addEventListener("change", () => scheduleScoringSave(null));
+}
+
+async function loadScoring() {
+  try {
+    SCORING = await (await fetch("/scoring")).json();
+  } catch (e) { SCORING = null; }
+  if (SCORING) renderScoringPanel(SCORING);
+  const toggle = $("scoretoggle");
+  if (toggle && !toggle.dataset.wired) {
+    toggle.dataset.wired = "1";
+    toggle.addEventListener("click", () => {
+      const panel = $("scoringpanel");
+      panel.hidden = !panel.hidden;
+      if (!panel.hidden) panel.scrollIntoView({behavior: "smooth", block: "nearest"});
+    });
+  }
+}
+
+function evidenceSummaryText(ev) {
+  if (!ev || !ev.scored) return "证据评分：无可用评分";
+  const order = ["强", "较强", "中等", "偏弱", "弱"];
+  const seg = order.filter(g => (ev.grades || {})[g]).map(g => g + " " + ev.grades[g]);
+  let text = "证据评分 平均 " + ev.mean + "（" + ev.scored + " 篇" + (seg.length ? "：" + seg.join(" / ") : "") + "）";
+  if (ev.unscored) text += "，另有 " + ev.unscored + " 篇未评分";
+  return text;
+}
+
+function evidenceHTML(p) {
+  const ev = p.evidence;
+  if (!ev) return "";
+  const cls = ev.grade_cls || "info";
+  let s = '<div class="evrow"><span class="evscore ' + cls + '">⚖️ 证据评分 ' +
+    (ev.total == null ? "—" : ev.total) + ' · ' + esc(ev.grade || "未评分") + '</span>';
+  if (ev.partial) s += '<span class="meta">（部分维度未取到评分，总分仅供参考）</span>';
+  if ((ev.contradicted_by || []).length)
+    s += '<span class="chip bad" style="font-size:11px">⚠️ 与 ' + ev.contradicted_by.length + ' 篇结论冲突</span>';
+  s += '</div>';
+  if (ev.dims && Object.keys(ev.dims).length) {
+    let rows = "";
+    for (const d of ((SCORING || {}).dimensions || [])) {
+      const v = ev.dims[d.key];
+      if (v == null) continue;
+      const risk = d.direction < 0;
+      const c = risk ? (v >= 60 ? "bad" : (v >= 35 ? "warn" : "good"))
+                     : (v >= 70 ? "good" : (v >= 45 ? "warn" : "bad"));
+      rows += '<tr><td>' + esc(d.label) +
+        '<div class="meta">' + esc(d.hint) + (risk ? " · 越高越差" : "") + '</div></td>' +
+        '<td class="' + c + '" style="width:44px">' + v + '</td>' +
+        '<td><div class="dbar ' + c + '" style="width:' + Math.max(2, v) + '%"></div></td></tr>';
+    }
+    if (rows) s += '<details class="evidence"><summary>⚖️ 维度明细（权重：' +
+      esc(((SCORING || {}).weights ? "已设置" : "默认")) + '）</summary><table class="stats dims">' + rows + '</table>' +
+      (ev.note ? '<div class="meta">评分说明：' + esc(ev.note) + '</div>' : "") + '</details>';
+  }
+  return s;
+}
+
+// screening ledger key: mirrors screening.paper_key() on the server; older
+// snapshots predate the server-side field, so it is recomputed as a fallback
+function paperKey(p) {
+  if (p.key) return p.key;
+  let doi = String(p.doi || "").trim().toLowerCase();
+  const marker = "doi.org/";              // accept a bare DOI or any doi.org URL
+  const at = doi.indexOf(marker);
+  if (at >= 0) doi = doi.slice(at + marker.length);
+  if (doi) return "doi:" + doi;
+  return "t:" + String(p.title || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function reasonOptions(decision, selected) {
+  const opts = (window.SCREEN_REASONS || {})[decision] || [];
+  return opts.map(o => '<option value="' + attr(o.key) + '"' + (o.key === selected ? " selected" : "") +
+    ">" + esc(o.label) + "</option>").join("");
+}
+
+function screeningRowHTML(p) {
+  return '<div class="srow" data-key="' + attr(paperKey(p)) + '" data-title="' + attr(p.title) + '">' +
+    '<span class="slab">筛选：</span>' +
+    '<button type="button" class="sbtn" data-d="include">纳入</button>' +
+    '<button type="button" class="sbtn" data-d="exclude">排除</button>' +
+    '<button type="button" class="sbtn" data-d="maybe">待定</button>' +
+    '<select class="sreason" hidden></select>' +
+    '<input class="snote" type="text" placeholder="备注（可选）" hidden>' +
+    '<button type="button" class="sbtn sclear" hidden>清除</button>' +
+    "</div>";
+}
+
+// repaint every card's screening row from the ledger (used after any render/load)
+function applyScreeningToCards() {
+  const store = window.SCREEN || {};
+  document.querySelectorAll(".srow").forEach(row => {
+    const rec = store[row.dataset.key] || null;
+    const decision = rec ? rec.decision : "";
+    row.dataset.decision = decision;
+    row.querySelectorAll(".sbtn[data-d]").forEach(b => {
+      b.classList.toggle("on", b.dataset.d === decision);
+      b.classList.toggle("include", b.dataset.d === "include");
+      b.classList.toggle("exclude", b.dataset.d === "exclude");
+      b.classList.toggle("maybe", b.dataset.d === "maybe");
+    });
+    const sel = row.querySelector(".sreason");
+    const note = row.querySelector(".snote");
+    const clear = row.querySelector(".sclear");
+    sel.hidden = note.hidden = clear.hidden = !decision;
+    sel.innerHTML = decision ? reasonOptions(decision, rec.reason || "") : "";
+    note.value = decision ? (rec.note || "") : "";
+  });
+}
+
+function renderScreeningChips(summary, total) {
+  const box = $("scchip");
+  if (!box) return;
+  const c = (summary && summary.counts) || {};
+  const inc = c.include || 0, exc = c.exclude || 0, may = c.maybe || 0;
+  const und = Math.max(0, (total || 0) - inc - exc - may);
+  box.textContent = "🧾 筛选：纳入 " + inc + " ｜ 排除 " + exc + " ｜ 待定 " + may + " ｜ 未筛选 " + und;
+  box.className = "chip " + (exc ? "warn" : (inc ? "good" : "info"));
+}
+
+async function refreshScreening(runId) {
+  window.SCREEN = {};
+  try {
+    const j = await (await fetch("/screening?run=" + encodeURIComponent(runId))).json();
+    window.SCREEN = j.decisions || {};
+    window.SCREEN_REASONS = j.reasons || {};
+    renderScreeningChips(j.summary, current && current.papers ? current.papers.length : 0);
+  } catch (e) { /* the ledger is optional: a failed read never blocks the run */ }
+  applyScreeningToCards();
+}
+
+async function postDecision(row, decision, reason, note) {
+  if (!current) return;
+  try {
+    const resp = await fetch("/screening", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({run: current.id, key: row.dataset.key, decision: decision,
+                            reason: reason || "", note: note || "",
+                            title: row.dataset.title || ""})});
+    const j = await resp.json();
+    if (!j || !j.ok) throw new Error((j && j.error) || "保存失败");
+    window.SCREEN = j.decisions || {};
+    applyScreeningToCards();
+    renderScreeningChips(j.summary, current.papers ? current.papers.length : 0);
+    flashMsg(decision ? ("已记录：" + ((j.summary.labels || {})[decision] || decision))
+                      : "已清除该论文的筛选记录");
+  } catch (err) {
+    flashMsg("筛选记录保存失败：" + (err.message || err));
+  }
+}
+
+document.addEventListener("click", async (e) => {
+  const btn = e.target && e.target.closest ? e.target.closest(".sbtn") : null;
+  if (!btn) return;
+  const row = btn.closest(".srow");
+  if (!row) return;
+  const note = (row.querySelector(".snote") || {}).value || "";
+  if (btn.classList.contains("sclear")) { await postDecision(row, "", "", note); return; }
+  const decision = btn.dataset.d;
+  const sel = row.querySelector(".sreason");
+  const choices = (window.SCREEN_REASONS || {})[decision] || [];
+  const picked = sel ? sel.value : "";
+  const reason = choices.some(o => o.key === picked) ? picked
+               : (choices.length ? choices[0].key : "");
+  await postDecision(row, decision, reason, note);
+});
+
+document.addEventListener("change", (e) => {
+  const el = e.target;
+  if (!el || !el.classList || !el.closest) return;
+  const row = el.closest(".srow");
+  if (!row || !row.dataset.decision) return;
+  if (el.classList.contains("sreason")) {
+    postDecision(row, row.dataset.decision, el.value, (row.querySelector(".snote") || {}).value || "");
+  } else if (el.classList.contains("snote")) {
+    postDecision(row, row.dataset.decision, (row.querySelector(".sreason") || {}).value || "", el.value);
+  }
+});
+
+// [n] inside the answer points at a card that now lives in a folded panel:
+// without this the link looks broken (anchor navigation does not open <details>)
+function revealPaper(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const det = el.closest ? el.closest("details") : null;
+  if (det) det.open = true;
+  el.scrollIntoView({behavior: "smooth", block: "center"});
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 1400);
+}
+
+function paperItemHTML(p, i) {
+  const seen = (p.seen_sources || [p.source]).join(" + ");
+  let s = '<div class="paper" id="cite-' + (i + 1) + '"><strong>' + (i + 1) + '. ' + esc(p.title) + "</strong>" +
+    (p.via_classic ? '<span class="cla">经典锚点</span>' : "") +
+    retractionHTML(p) +
+    "<div class='meta'>" + (p.year || "-") + " ｜ 被引 " + (p.citations || 0) + " ｜ 首见来源 " + esc(p.source || "") +
+    " ｜ 命中来源 " + esc(seen) + (p.venue ? " ｜ 刊物/会议 " + esc(p.venue) : "") + "</div>" +
+    "<div class='meta'>作者：" + esc((p.authors || []).join("; ") || "未知") + "</div>" +
+    (p.abstract ? "<div class='meta abs' title='点击展开 / 收起摘要'>" + esc(p.abstract) + "</div>" : "") +
+    '<div class="links">' + paperLinks(p, i) + "</div>" +
+    evidenceHTML(p) + screeningRowHTML(p) + "</div>";
+  return s;
+}
+
+function paperListHTML(data) {
+  let s = '<div class="panel" id="answerbox"><h2 style="margin-top:0">检索到 ' +
+    data.papers.length + ' 篇论文（排序：' + esc(data.sort_label || "相关性") + '）</h2>';
+  data.papers.forEach((p, i) => { s += paperItemHTML(p, i); });
+  return s + "</div>";
+}
+
+const SORT_LABELS = {relevance:"相关性", year_desc:"发表时间 近→远", year_asc:"发表时间 远→近",
+  cited_desc:"被引量 高→低", cited_asc:"被引量 低→高", title_asc:"标题 A→Z"};
+const SORT_FIELDS = {year_desc:["year", -1], year_asc:["year", 1],
+  cited_desc:["citations", -1], cited_asc:["citations", 1], title_asc:["title", 1]};
+
+function sortPapersLocal(papers, key) {
+  const spec = SORT_FIELDS[key];
+  if (!spec) return papers.slice();
+  const [field, dir] = spec;
+  const arr = papers.slice();
+  arr.sort((a, b) => {
+    const va = a[field], vb = b[field];
+    const ma = (va == null || va === "") ? 1 : 0;
+    const mb = (vb == null || vb === "") ? 1 : 0;
+    if (ma !== mb) return ma - mb;              // missing values sink to bottom
+    if (ma) return 0;
+    const r = typeof va === "string"
+      ? String(va).localeCompare(String(vb), "zh-Hans")
+      : (Number(va) - Number(vb));
+    return r * dir;
+  });
+  return arr;
+}
+
+function hasRelevanceScores(data) {
+  return !!(data.scores && data.scores.length);
+}
+
+function rebuildBib() {
+  if (!current) return;
+  const map = {};
+  const per = current.per_paper_bibtex || {};
+  Object.keys(per).forEach(k => {
+    const idx = Number(k);
+    const p = current.papers[idx];
+    if (p) map[p.title] = per[k];
+  });
+  window.BIBTEX = current.papers.map(p => map[p.title]);
+}
+
+function applyLocalSort() {
+  if (!current || current.mode !== "search") return;
+  const key = $("sort").value;
+  relevancePending = false;
+  if (key === "relevance") {
+    if (hasRelevanceScores(current)) {
+      const sc = {};
+      current.scores.forEach(s => { sc[s.title] = s.score; });
+      current.papers = current.papers.slice().sort((a, b) => (sc[b.title] || 0) - (sc[a.title] || 0));
+    } else {
+      relevancePending = true;      // keep order; offer re-scoring without re-search
+    }
+  } else {
+    current.papers = sortPapersLocal(current.papers, key);
+  }
+  current.sort = key;
+  current.sort_label = SORT_LABELS[key] || key;
+  current.localSorted = true;
+  rebuildBib();
+  renderAudits(current);
+}
+
+async function rerankCurrent() {
+  if (!current) return;
+  btn.disabled = true;
+  progress.classList.add("visible");
+  stage.textContent = "对当前 " + current.papers.length + " 篇论文重新打相关性分（不重新检索）…";
+  try {
+    const resp = await fetch("/rerank", {method:"POST", headers:{"Content-Type":"application/json"},
+                                         body: JSON.stringify({id: current.id})});
+    const j = await resp.json();
+    if (j.error) throw new Error(j.error);
+    let data = j.data || null;
+    if (!data) {
+      const st = await (await fetch("/status?id=" + encodeURIComponent(current.id))).json();
+      if (st.status !== "done" || !st.data) throw new Error("重打分未完成");
+      data = st.data;
+    }
+    current = data;
+    window.EX = data.exports || {};
+    window.SNAP = JSON.stringify(data);
+    relevancePending = false;
+    rebuildBib();
+    renderAudits(current);
+    refreshScreening(current.id);
+  } catch (err) {
+    stage.textContent = "重打分失败";
+    answerBox.innerHTML = '<p class="error">' + esc(err.message || err) + "</p>";
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => progress.classList.remove("visible"), 800);
+  }
+}
+
+function wireRerankBtn() {
+  const b = $("rerankBtn");
+  if (b && !b.dataset.wired) {
+    b.addEventListener("click", rerankCurrent);
+    b.dataset.wired = "1";
+  }
+}
+
+const BADGE_META = {
+  cross: {cls: "cross", label: "多篇交叉支持"},
+  fulltext: {cls: "ft", label: "全文支持"},
+  abstract: {cls: "abs", label: "仅摘要支持"},
+  unknown: {cls: "unk", label: "支持（未取到原文）"},
+  unsupported: {cls: "uns", label: "不支持"}
+};
+
+function badgeFor(cl) {
+  if (cl.badge && BADGE_META[cl.badge]) {
+    return {key: cl.badge, label: cl.badge_label || BADGE_META[cl.badge].label, note: cl.badge_note || ""};
+  }
+  // snapshots written before badges existed: derive the same classification
+  if (!cl.supported) return {key: "unsupported", label: "不支持", note: "判决：该声明未被证据支持"};
+  const sup = cl.supporting || [];
+  const ev = cl.evidence || [];
+  const supEv = ev.filter(e => sup.indexOf(e.n) >= 0);
+  const full = supEv.filter(e => e.source === "full-text").length;
+  const abs = supEv.filter(e => e.source === "abstract").length;
+  if (sup.length >= 2) {
+    return {key: "cross", label: "多篇交叉支持", note: sup.length + " 篇论文共同支持"};
+  }
+  if (full) return {key: "fulltext", label: "全文支持", note: "支持论文核对到全文原文段落"};
+  if (abs) return {key: "abstract", label: "仅摘要支持", note: "支持论文仅核对到摘要"};
+  return {key: "unknown", label: "支持（未取到原文）", note: ""};
+}
+
+function badgeHTML(cl) {
+  const b = badgeFor(cl);
+  const meta = BADGE_META[b.key] || BADGE_META.unknown;
+  const note = b.note ? " title='" + esc(b.note).replace(/'/g, "%27") + "'" : "";
+  return "<span class='badge " + meta.cls + "'" + note + ">" + b.label + "</span>";
+}
+
+function snippetsHTML(ev) {
+  let out = "";
+  for (const e of ev) {
+    const link = e.pdf_url || e.url || "";
+    out += "<span class='snip'><span class='evsrc'>[" + e.n + "] " + esc(e.title) +
+      (e.in_answer === false ? " · 补充检索（不在正文引用中）" : "") +
+      (e.retracted ? " · 🚫 已撤稿" : "") +
+      " · " + (e.source === "abstract" ? "摘要" : "全文") +
+      (link ? " · <a href='" + esc(link).replace(/'/g, "%27") + "' target='_blank' rel='noopener'>原文 ↗</a>" : "") +
+      "</span>";
+    for (const psg of (e.passages || [])) {
+      out += "<span class='evsnip'>" + esc(psg.text) + "</span>";
+    }
+    out += "</span>";
+  }
+  return out;
+}
+
+function evInlineHTML(cl) {
+  if (!cl) return "";
+  const ev = cl.evidence || [];
+  let out = "<span class='evwrap'>" + badgeHTML(cl);
+  if (ev.length) {
+    const n = ev.reduce((a, e) => a + ((e.passages || []).length), 0);
+    out += "<button type='button' class='evbtn" + (cl.supported ? "" : " bad") + "'>" +
+      (cl.supported ? "📎 原文证据" : "📎 查看所引原文") + (n ? "（" + n + "）" : "") + "</button>" +
+      "<span class='evbody' hidden>" + snippetsHTML(ev) + "</span>";
+  }
+  return out + "</span>";
+}
+
+function renderClaimEvidence(cl) {
+  const ev = cl.evidence || [];
+  if (!ev.length) return "";
+  return "<details class='evidence'><summary>📎 支撑原文片段（" + ev.length + " 篇）</summary>" +
+    snippetsHTML(ev) + "</details>";
+}
+
+let GRAPH_INFO = null;
+
+function graphPanelHTML(info, timings) {
+  const tm = timings || {};
+  const values = info.nodes.map(n => (typeof tm[n.id] === "number" ? tm[n.id] : 0)).concat([1]);
+  const maxT = Math.max.apply(null, values);
+  let rows = "";
+  for (const n of info.nodes) {
+    const t = tm[n.id];
+    const has = typeof t === "number";
+    rows += "<tr><td><code>" + esc(n.id) + "</code></td><td>" + esc(n.label) +
+      "<div class=\'meta\'>" + esc(n.note) + "</div></td>" +
+      "<td class=\'meta\'>" + esc(n.impl) + "</td><td>" +
+      (has ? "<span class=\'gt\'>" + t.toFixed(1) + "s</span><div class=\'gbar\' style=\'width:" +
+              Math.max(2, Math.round(t / maxT * 100)) + "%\'></div>"
+           : "<span class=\'meta\'>未执行</span>") + "</td></tr>";
+  }
+  const edges = info.edges.map(e =>
+    esc(e.source) + (e.conditional ? " ⇢ " : " → ") + esc(e.target)).join("<br>");
+  const srcs = (info.sources || []).map(s => s.label + (s.available ? "" : "（未启用）")).join(" + ");
+  return "<summary>🔧 查看管线结构（LangGraph 运行时读取）</summary>" +
+    "<div class=\'meta\'>节点 " + info.nodes.length + " 个 · 连边 " + info.edges.length +
+    " 条 · 回环 " + esc(info.loop || "") + "（最多 " + info.max_rounds + " 轮）· 每词取 " +
+    info.papers_per_query + " 篇、ask 模式保留 top " + info.max_total_papers +
+    (info.classic ? " · 经典锚点：首轮前 " + info.classic.queries + " 词按被引量取 " +
+      info.classic.per_query + " 篇（≥" + info.classic.min_citations + " 引，否则取最高被引 1 篇）" : "") +
+    (info.scoring ? " · 证据评分：" + info.scoring.dimensions.length + " 维度加权、最多 " +
+      info.scoring.max_papers + " 篇（可选）" : "") +
+    "</div>" +
+    "<table class=\'stats\'><tr><th>节点</th><th>阶段</th><th>实现</th><th>本次耗时</th></tr>" +
+    rows + "</table>" +
+    "<div class=\'meta\' style=\'margin-top:8px\'><strong>连边</strong>（⇢ 为条件边）<br>" + edges + "</div>" +
+    "<div class=\'meta\' style=\'margin-top:6px\'><strong>数据源</strong>：" + esc(srcs) + "</div>";
+}
+
+async function renderGraphPanel(timings) {
+  const box = $("graphpanel");
+  if (!box) return;
+  try {
+    if (!GRAPH_INFO) GRAPH_INFO = await (await fetch("/graph")).json();
+  } catch (err) {
+    box.innerHTML = "<summary>🔧 查看管线结构</summary><div class=\'meta\'>读取失败：" +
+      esc(err.message || err) + "</div>";
+    return;
+  }
+  box.innerHTML = graphPanelHTML(GRAPH_INFO, timings);
+}
+
+// ---------------------------------------------------------------- 领域探索
+// 用户给一个领域，先拆成若干方向；可以逐层「深入这一支」，也可以勾选若干
+// 方向直接要一份综述报告。会话本身是一条历史记录（mode=explore），报告则
+// 是一次普通的 survey 运行，因此导出、三层校验、追问对话对它同样可用。
+const EXPLORE = {runId: "", topic: "", path: [], seen: [], turns: [], last: [],
+                 selected: {}, busy: false, job: null};
+
+function modeLabel(m) {
+  return m === "ask" ? "智能问答" : m === "search" ? "仅搜索论文"
+       : m === "explore" ? "领域探索" : m === "survey" ? "综述报告" : (m || "");
+}
+
+function explorePanelHTML() {
+  return '<details class="panel" id="explorepanel" open>' +
+    '<summary>🔭 领域探索 · ' + esc(EXPLORE.topic || "") +
+    '<span class="meta" id="expcount"></span></summary>' +
+    '<div id="exppath"></div>' +
+    '<div class="meta" id="exphint"></div>' +
+    '<div id="expdirs"></div>' +
+    '<div class="expbar">' +
+      '<span class="meta" id="expsel"></span>' +
+      '<button type="button" id="expsurvey">📝 用选中的方向生成综述报告</button>' +
+      '<button type="button" class="ghost" id="expsurveyall">全部方向生成报告</button>' +
+      '<button type="button" class="ghost" id="expback">↰ 返回上一层</button>' +
+    '</div>' +
+    '<details class="explog"><summary class="meta">探索足迹</summary><div id="explog"></div></details>' +
+    '</details>';
+}
+
+function expHint(html) {
+  const el = $("exphint");
+  if (el) el.innerHTML = html;
+}
+
+function dirCardHTML(d, i) {
+  const on = !!EXPLORE.selected[d.name];
+  const refs = (d.refs || []).map(r =>
+    '<li><a href="' + attr(r.url || "#") + '" target="_blank" rel="noopener">' +
+    esc(r.title || "") + "</a><span class='meta'> " + esc(r.year || "?") +
+    " · 被引 " + (r.citations || 0) + (r.venue ? " · " + esc(r.venue) : "") + "</span></li>").join("");
+  return '<div class="dircard' + (on ? " on" : "") + '">' +
+    '<div class="dirhead">' +
+      '<label><input type="checkbox"' + (on ? " checked" : "") +
+        ' onchange="exploreToggle(' + i + ')"> <b>' + esc(d.name || "") + "</b>" +
+        (d.en ? '<span class="diren">' + esc(d.en) + "</span>" : "") + "</label>" +
+      '<button type="button" class="ghost mini" onclick="exploreDeepen(' + i + ')">深入这一支 ↳</button>' +
+    "</div>" +
+    (d.why ? '<div class="dirwhy">' + esc(d.why) + "</div>" : "") +
+    (d.queries && d.queries.length
+      ? '<div class="dirq">检索词：' + d.queries.map(esc).join(" · ") + "</div>" : "") +
+    (refs ? '<ul class="dirrefs">' + refs + "</ul>" : "") +
+    "</div>";
+}
+
+function renderExplorePanel() {
+  const dirs = EXPLORE.last || [];
+  const c = $("expcount");
+  if (c) c.textContent = EXPLORE.turns.length ? "｜已展开 " + EXPLORE.turns.length + " 层" : "";
+  const p = $("exppath");
+  if (p) p.innerHTML = EXPLORE.path.length
+    ? '<span class="chip info">调研路径：' + EXPLORE.path.map(esc).join(" → ") + "</span>" : "";
+  const d = $("expdirs");
+  if (d) d.innerHTML = dirs.length ? dirs.map(dirCardHTML).join("")
+                                   : '<div class="meta">正在拆解方向…</div>';
+  const n = Object.keys(EXPLORE.selected).length;
+  const sel = $("expsel");
+  if (sel) sel.textContent = dirs.length ? "已选 " + n + " / " + dirs.length + " 个方向" : "";
+  const back = $("expback");
+  if (back) back.style.display = EXPLORE.path.length ? "" : "none";
+  const sb = $("expsurvey");
+  if (sb) sb.disabled = !dirs.length || EXPLORE.busy;
+  const sa = $("expsurveyall");
+  if (sa) sa.disabled = !dirs.length || EXPLORE.busy;
+}
+
+function renderExploreLog() {
+  const el = $("explog");
+  if (!el) return;
+  el.innerHTML = EXPLORE.turns.map((t, i) => {
+    const who = t.parent && t.parent.name ? t.parent.name : (t.topic || "领域");
+    const names = (t.directions || []).map(x => x.name).join("、");
+    return '<div class="exstep">第 ' + (i + 1) + " 层 · " + esc(who) + " → " + esc(names || "（无）") +
+      "</div>";
+  }).join("") || '<div class="meta">还没有足迹</div>';
+}
+
+function exploreToggle(i) {
+  const d = (EXPLORE.last || [])[i];
+  if (!d) return;
+  if (EXPLORE.selected[d.name]) delete EXPLORE.selected[d.name];
+  else EXPLORE.selected[d.name] = true;
+  renderExplorePanel();
+}
+
+async function exploreSend(action, extra) {
+  const body = Object.assign({
+    action: action, id: EXPLORE.runId, topic: EXPLORE.topic,
+    path: EXPLORE.path, seen: EXPLORE.seen,
+  }, extra || {});
+  const r = await fetch("/explore", {method: "POST", headers: {"Content-Type": "application/json"},
+                                     body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(j.error || "无法开始探索");
+  if (j.run_id) EXPLORE.runId = j.run_id;
+  return j.id;
+}
+
+async function pollExplore(jid) {
+  for (;;) {
+    await new Promise(r => setTimeout(r, 1500));
+    let st;
+    try {
+      st = await (await fetch("/status?id=" + encodeURIComponent(jid))).json();
+    } catch (e) { return {status: "error", error: String(e)}; }
+    if (st.status === "running" || st.status === "queued") {
+      expHint("⏳ " + esc(st.stage || "运行中…") +
+        ' <button type="button" class="ghost mini" onclick="exploreStop()">⏹ 停止</button>');
+      continue;
+    }
+    return st;
+  }
+}
+
+async function exploreStop() {
+  if (!EXPLORE.job) return;
+  try {
+    await fetch("/cancel", {method: "POST", headers: {"Content-Type": "application/json"},
+                            body: JSON.stringify({id: EXPLORE.job})});
+    expHint("正在停止…");
+  } catch (e) {}
+}
+
+function applyExploreStatus(st) {
+  EXPLORE.busy = false;
+  if (st.status !== "done" || !st.data || !st.data.explore_turn) {
+    renderExplorePanel();
+    expHint('<span class="cerr">探索失败：' + esc(st.error || st.stage || "未知错误") +
+            "</span>（可以改一下领域描述再试）");
+    return;
+  }
+  const turn = st.data.explore_turn;
+  EXPLORE.turns.push(turn);
+  EXPLORE.last = turn.directions || [];
+  if (turn.topic) EXPLORE.topic = turn.topic;
+  EXPLORE.path = (turn.parent && turn.parent.name)
+    ? (turn.path || []).concat([turn.parent.name]) : (turn.path || []);
+  EXPLORE.last.forEach(d => { if (EXPLORE.seen.indexOf(d.name) < 0) EXPLORE.seen.push(d.name); });
+  EXPLORE.selected = {};
+  renderExplorePanel();
+  renderExploreLog();
+  expHint(turn.degraded
+    ? '<span class="cerr">方向拆解失败，已退化为「直接用你的问题检索」。</span>可以直接点「全部方向生成报告」。'
+    : "选一个方向「深入这一支」继续细化，或勾选若干方向后生成综述报告；也可以直接「全部方向生成报告」。");
+  refreshHistory();
+}
+
+function showExplorePanel() {
+  setEmptyVisible(false);
+  chips.innerHTML = ""; toolbar.innerHTML = ""; logBox.style.display = "none";
+  answerBox.innerHTML = explorePanelHTML();
+  renderExplorePanel();
+  renderExploreLog();
+  const sb = $("expsurvey");
+  if (sb) sb.addEventListener("click", () => exploreSurvey(false));
+  const sa = $("expsurveyall");
+  if (sa) sa.addEventListener("click", () => exploreSurvey(true));
+  const bk = $("expback");
+  if (bk) bk.addEventListener("click", exploreBack);
+}
+
+function exploreBack() {
+  if (EXPLORE.busy || !EXPLORE.turns.length) return;
+  EXPLORE.turns.pop();
+  const prev = EXPLORE.turns[EXPLORE.turns.length - 1];
+  EXPLORE.last = prev ? (prev.directions || []) : [];
+  EXPLORE.path = prev && prev.parent && prev.parent.name
+    ? (prev.path || []).concat([prev.parent.name]) : (prev ? (prev.path || []) : []);
+  EXPLORE.selected = {};
+  renderExplorePanel();
+  renderExploreLog();
+  expHint(prev ? "已回到上一层。" : "已回到最开始一层。");
+}
+
+async function exploreStart(topic) {
+  EXPLORE.topic = topic; EXPLORE.runId = ""; EXPLORE.path = [];
+  EXPLORE.seen = []; EXPLORE.turns = []; EXPLORE.last = []; EXPLORE.selected = {};
+  showExplorePanel();
+  expHint("⏳ ScholarMate 正在把「" + esc(topic) + "」拆成可分别调研的方向，并给每个方向取几篇代表作…");
+  progress.classList.add("visible");
+  btn.disabled = true;
+  try {
+    EXPLORE.busy = true;
+    EXPLORE.job = await exploreSend("scope", {topic: topic});
+    applyExploreStatus(await pollExplore(EXPLORE.job));
+  } catch (e) {
+    EXPLORE.busy = false;
+    expHint('<span class="cerr">探索失败：' + esc(e && e.message ? e.message : e) + "</span>");
+  } finally {
+    EXPLORE.job = null;
+    btn.disabled = false;
+    setTimeout(() => progress.classList.remove("visible"), 600);
+  }
+}
+
+async function exploreDeepen(i) {
+  const d = (EXPLORE.last || [])[i];
+  if (!d || EXPLORE.busy) return;
+  EXPLORE.busy = true;
+  EXPLORE.path = EXPLORE.path.concat([d.name]);
+  EXPLORE.selected = {};
+  renderExplorePanel();
+  expHint("⏳ 正在把「" + esc(d.name) + "」拆成更具体的下一层方向…");
+  progress.classList.add("visible");
+  try {
+    EXPLORE.job = await exploreSend("deepen", {direction: d, topic: EXPLORE.topic});
+    applyExploreStatus(await pollExplore(EXPLORE.job));
+  } catch (e) {
+    EXPLORE.busy = false;
+    renderExplorePanel();
+    expHint('<span class="cerr">深入失败：' + esc(e && e.message ? e.message : e) + "</span>");
+  } finally {
+    EXPLORE.job = null;
+    setTimeout(() => progress.classList.remove("visible"), 600);
+  }
+}
+
+async function exploreSurvey(all) {
+  let chosen = (EXPLORE.last || []).filter(d => EXPLORE.selected[d.name]);
+  if (all || !chosen.length) chosen = (EXPLORE.last || []).slice();
+  if (!chosen.length) { expHint("请先选择至少一个方向。"); return; }
+  if (EXPLORE.busy) return;
+  EXPLORE.busy = true;
+  renderExplorePanel();
+  expHint("⏳ 正在按 " + chosen.length + " 个方向检索并撰写综述报告（" +
+          esc(chosen.map(d => d.name).join("、")) + "），完成后会做三层引用校验…");
+  progress.classList.add("visible");
+  setRunning(true);
+  try {
+    EXPLORE.job = await exploreSend("survey", {
+      directions: chosen, question: EXPLORE.topic, path: EXPLORE.path,
+      deep_verify: true, score_evidence: ($("scoreevidence") || {}).checked || false,
+    });
+    const st = await pollExplore(EXPLORE.job);
+    EXPLORE.busy = false;
+    if (st.status === "done" && st.data) {
+      const data = st.data;
+      window.EX = data.exports || {};
+      window.SNAP = JSON.stringify(data);
+      current = data;
+      $("sort").value = data.sort || "relevance";
+      rebuildBib();
+      renderAudits(data);
+      refreshScreening(data.id);
+      refreshHistory();
+    } else if (st.status === "cancelled") {
+      expHint("已停止这次综述生成。上面的方向还在，可以重新点一次。");
+      renderExplorePanel();
+    } else {
+      expHint('<span class="cerr">综述生成失败：' + esc(st.error || st.stage || "未知错误") + "</span>");
+      renderExplorePanel();
+    }
+  } catch (e) {
+    EXPLORE.busy = false;
+    renderExplorePanel();
+    expHint('<span class="cerr">综述生成失败：' + esc(e && e.message ? e.message : e) + "</span>");
+  } finally {
+    EXPLORE.job = null;
+    progress.classList.remove("visible");
+    setRunning(false);
+  }
+}
+
+function restoreExplore(data) {
+  EXPLORE.runId = data.id; EXPLORE.topic = data.question || "";
+  EXPLORE.turns = (data.explore || []).filter(t => (t.directions || []).length);
+  EXPLORE.last = []; EXPLORE.path = []; EXPLORE.seen = []; EXPLORE.selected = {};
+  for (const t of EXPLORE.turns) {
+    EXPLORE.last = t.directions || [];
+    EXPLORE.path = (t.parent && t.parent.name)
+      ? (t.path || []).concat([t.parent.name]) : (t.path || []);
+    EXPLORE.last.forEach(d => { if (EXPLORE.seen.indexOf(d.name) < 0) EXPLORE.seen.push(d.name); });
+  }
+  showExplorePanel();
+  expHint(EXPLORE.turns.length
+    ? "这是这次探索会话的记录。选一个方向「深入这一支」，或勾选方向生成综述报告。"
+    : "这次会话还没有产出方向。");
+}
+
+function renderAudits(data) {
+  setEmptyVisible(false);   // results replace the example-question hints
+  if (data.mode === "explore") { restoreExplore(data); return; }
+  const audits = data.audits || {};
+  let html = "";
+  const c = data.counts || {};
+  const answered = data.mode === "ask" || data.mode === "survey";
+  if (answered && data.answer) {
+    const claims = (audits.claims || {}).verdicts || [];
+    html += '<div class="panel" id="answerbox">' + render(data.answer, claims) + "</div>";
+  } else if (data.mode === "search") {
+    html += paperListHTML(data);
+  } else {
+    html += '<div class="panel" id="answerbox">' + render(data.answer) + "</div>";
+  }
+  const chipsHtml = [];
+  if (answered) {
+    if (c.rule) chipsHtml.push('<span class="chip ' + (c.rule.bad ? "bad" : "good") + '">规则校验 通过 ' + c.rule.ok + ' / 告警 ' + c.rule.warn + ' / 失败 ' + c.rule.bad + '</span>');
+    if (c.llm) chipsHtml.push('<span class="chip ' + (c.llm.unsupported ? "bad" : "good") + '">LLM 归因 支持 ' + c.llm.supported + ' / 不支持 ' + c.llm.unsupported + '</span>');
+    if (c.claims) {
+      if (c.claims.skipped) {
+        chipsHtml.push('<span class="chip warn">逐句证据 已跳过（快速模式）</span>');
+      } else {
+        let claimTxt = "逐句证据 " + c.claims.supported + "/" + (c.claims.supported + c.claims.unsupported) + " 支持";
+        const bd = c.claims.badges || {};
+        const seg = [];
+        if (bd.cross) seg.push("多篇交叉 " + bd.cross);
+        if (bd.fulltext) seg.push("全文 " + bd.fulltext);
+        if (bd.abstract) seg.push("仅摘要 " + bd.abstract);
+        if (bd.unknown) seg.push("未取到原文 " + bd.unknown);
+        if (seg.length) claimTxt += "（" + seg.join(" · ") + "）";
+        if (c.claims.evidence_snippets) {
+          claimTxt += " · 可核对原文 " + c.claims.evidence_snippets + " 段";
+        }
+        chipsHtml.push('<span class="chip ' + (c.claims.unsupported ? "bad" : "good") + '">' + claimTxt + '</span>');
+      }
+      const fs = c.claims.fulltext_stats || {};
+      if (fs.total) {
+        chipsHtml.push('<span class="chip info">📚 全文缓存命中 ' +
+          ((fs.memo_hits || 0) + (fs.cache_hits || 0)) + "/" + fs.total +
+          "（" + Math.round((fs.cache_hit_rate || 0) * 100) + "%）</span>");
+      }
+    }
+  }
+  const rt = data.retraction || {};
+  if (rt.skipped) {
+    chipsHtml.push('<span class="chip info" title="在「仅检索论文」模式下默认跳过；勾选「撤稿筛查」或回到智能问答即可启用">🚫 撤稿筛查已跳过</span>');
+  } else if (rt.retracted) {
+    chipsHtml.push('<span class="chip bad" title="' + esc((rt.retracted_titles || []).join("; ")).replace(/'/g, "%27") +
+      '">🚫 撤稿论文 ' + rt.retracted + ' 篇</span>');
+  } else if (rt.checked) {
+    chipsHtml.push('<span class="chip good">撤稿筛查 通过（已核对 ' + rt.checked + ' 篇' +
+      (rt.unchecked ? " · 无法核对 " + rt.unchecked + " 篇" : "") + '）</span>');
+  }
+  if (data.filters_label && data.filters_label !== "不限") chipsHtml.push('<span class="chip info">筛选：' + esc(data.filters_label) + '</span>');
+  const tf = data.tier_filter || {};
+  if (tf.enabled) {
+    let ttxt = "🏷 刊物层级 " + (tf.labels || []).join("、") + "：保留 " + (tf.kept || 0) + "/" + (tf.seen || 0) + " 篇";
+    if (tf.dropped) ttxt += "，滤除 " + tf.dropped + " 篇";
+    if (tf.dropped_unclassified) ttxt += "（其中 " + tf.dropped_unclassified + " 篇查不到层级）";
+    if (tf.estimated) ttxt += "；" + tf.estimated + " 篇层级为估算";
+    const ttip = "只在勾选的层级里出结果。没有期刊层级数据的是会议论文、预印本或未收录刊物；"
+      + "勾上「保留会议/预印本/未分类」就会一起保留。分区来自本地表（outputs/journal_tiers.json），"
+      + "未收录的刊物按 OpenAlex 期刊影响力估算。";
+    chipsHtml.push('<span class="chip ' + (tf.kept ? "info" : "warn") + '" title="' + ttip + '">' + esc(ttxt) + '</span>');
+  }
+  chipsHtml.push('<span class="chip info">' + esc(data.sort_label || "相关性") + '</span>');
+  chipsHtml.push('<span class="chip info">论文 ' + data.papers.length + ' 篇 · ' + (data.duration_s || 0) + 's</span>');
+  if (data.papers.length) chipsHtml.push('<span class="chip info" id="scchip">🧾 筛选：读取中…</span>');
+  if (data.evidence && !data.evidence.skipped) {
+    const ev = data.evidence;
+    if (ev.error) chipsHtml.push('<span class="chip bad">⚖️ 证据评分失败：' + esc(ev.error) + '</span>');
+    else if (ev.scored) {
+      const cls = ev.mean >= 65 ? "good" : (ev.mean >= 50 ? "warn" : "bad");
+      chipsHtml.push('<span class="chip ' + cls + '" title="按你设置的权重加权合成">⚖️ ' +
+        esc(evidenceSummaryText(ev)) + '</span>');
+    } else {
+      chipsHtml.push('<span class="chip info">⚖️ 证据评分：无可用评分</span>');
+    }
+  }
+  if (data.mode === "search" && data.localSorted) chipsHtml.push('<span class="chip info">已本地重排 · 未重新检索</span>');
+  if (data.mode === "search" && data.sort === "relevance" && !hasRelevanceScores(data))
+    chipsHtml.push('<span class="chip warn">相关性：按最近一次服务端结果顺序，可点击重新打分</span>');
+  if (data.mode === "survey" && (data.directions || []).length) {
+    chipsHtml.push('<span class="chip info" title="' +
+      attr((data.explore_path || []).join(" → ")) + '">🔭 领域探索 · ' +
+      (data.directions || []).length + ' 个方向：' +
+      esc((data.directions || []).map(d => d.name).join("、")) + '</span>');
+  }
+  chips.innerHTML = chipsHtml.join("");
+
+  // export toolbar
+  const ex = data.exports || {};
+  if (data.papers.length) {
+    toolbar.innerHTML = [
+      '<span class="slab">📤 导出与台账（' + data.papers.length + ' 篇）</span>',
+      '<button class="ghost" onclick="exportCurrent(\\'bibtex\\', \\'scholarmate-' + data.id + '.bib\\', \\'text/x-bibtex\\')">⬇ BibTeX</button>',
+      '<button class="ghost" onclick="exportCurrent(\\'ris\\', \\'scholarmate-' + data.id + '.ris\\', \\'application/x-research-info-systems\\')">⬇ RIS</button>',
+      '<button class="ghost" onclick="exportCurrent(\\'gbt\\', \\'scholarmate-' + data.id + '-gbt.txt\\', \\'text/plain;charset=utf-8\\')">⬇ GB/T 7714</button>',
+      '<button class="ghost" onclick="exportCurrent(\\'csl\\', \\'scholarmate-' + data.id + '.json\\', \\'application/json\\')">⬇ CSL-JSON</button>',
+      '<button class="ghost" onclick="exportPapersCsv()">⬇ 论文清单 CSV（含摘要）</button>',
+      '<button class="ghost" onclick="downloadSnapshot()">⬇ 检索快照（当前顺序）</button>',
+      '<button class="ghost" onclick="exportPrisma()">⬇ PRISMA 筛选表（CSV）</button>',
+      '<button class="ghost" onclick="exportPrismaMd()">⬇ 筛选台账（Markdown）</button>',
+      '<button class="ghost" onclick="exportCurrent(\\'bibtex\\', \\'scholarmate-' + data.id + '-included.bib\\', \\'text/x-bibtex\\', \\'include\\')">⬇ 仅纳入文献 BibTeX</button>',
+      '<button class="ghost" onclick="exportPapersCsv(\\'include\\')">⬇ 仅纳入清单 CSV</button>',
+    ].join("");
+    if (hasEvidenceScores(data)) {
+      toolbar.innerHTML += '<button class="ghost" onclick="exportEvidence()">⬇ 证据评分表（CSV）</button>';
+    }
+    if (data.mode === "search" && data.sort === "relevance" && !hasRelevanceScores(data)) {
+      toolbar.innerHTML += '<button id="rerankBtn" class="ghost">🔁 对当前结果重新打相关性分（不重新检索）</button>';
+      wireRerankBtn();
+    }
+  }
+  if (data.answer) {
+    const docLabel = data.mode === "ask" ? "回答" : data.mode === "survey" ? "综述报告" : "检索结果";
+    toolbar.innerHTML +=
+      '<button class="ghost" onclick="exportAnswerMd()">⬇ ' + docLabel + ' Markdown</button>' +
+      '<button class="ghost" onclick="exportAnswerDocx()">⬇ ' + docLabel + ' Word（.docx）</button>';
+    if (answered) {
+      toolbar.innerHTML += '<button class="ghost" onclick="copyAnswerMarkdown()">📋 复制 Markdown 报告</button>';
+    }
+  }
+
+  // audit detail panels
+  if (answered && (audits.llm || {}).verdicts) {
+    html += '<details class="panel"><summary>🔎 三层校验明细（点击展开）</summary>';
+    html += "<h3 style='font-size:14px'>① 规则校验</h3><div class='meta'>" + esc(((audits.rules.lines) || []).join("\\n")) + "</div>";
+    const llm = (audits.llm.verdicts || []);
+    html += "<h3 style='font-size:14px'>② LLM 归因</h3>";
+    for (const v of llm) {
+      html += '<div class="claim ' + (v.supported ? "sup" : "unsup") + '">[' + v.n + '] ' + esc(v.title) +
+        '<br><span class="' + (v.supported ? "" : "error") + '">' + (v.supported ? "✅ 支持" : "❌ 不支持") + '</span> · ' + esc(v.reason || "") + "</div>";
+    }
+    const claims = (audits.claims.verdicts || []);
+    html += "<h3 style='font-size:14px'>③ 逐句证据（声明级判决）</h3>";
+    if (audits.claims.skipped) {
+      html += '<div class="meta">本次运行关闭了逐句全文校验（快速模式）——勾选「逐句全文校验」后重跑即可获得声明级证据与徽标</div>';
+    } else if (!claims.length) {
+      html += '<div class="meta">本次未提取到可判决声明</div>';
+    }
+    for (const cl of claims) {
+      const bf = badgeFor(cl);
+      html += '<div class="claim ' + (cl.supported ? "sup" : "unsup") + '">' +
+        (cl.supported ? "✅" : "❌") + " " + badgeHTML(cl) + " 声明 " + cl.id + "：<strong>" + esc(cl.text) + "</strong>" +
+        "<div class='meta'>" + (bf.note ? esc(bf.note) + " ｜ " : "") + "支持来源：" + esc((cl.titles || []).join("; ") || "无") +
+        (cl.reason ? " ｜ 理由：" + esc(cl.reason) : "") + "</div>" +
+        renderClaimEvidence(cl) + "</div>";
+    }
+    html += "</details>";
+  }
+
+  // retrieval stats
+  if ((data.retrieval_log || []).length) {
+    const tm = data.timings || {};
+    const tmKeys = Object.keys(tm);
+    let tmNote = "";
+    if (tmKeys.length) {
+      const top = tmKeys.sort((a, b) => tm[b] - tm[a])
+        .map(k => k + " " + tm[k].toFixed(1) + "s").join(" · ");
+      tmNote = '<div class="meta">⏱ 阶段耗时：' + esc(top) + "</div>";
+    }
+    const srcs = (data.sources || []).filter(s => s.available).map(s => s.label);
+    const srcNote = srcs.length ? "（并行检索：" + esc(srcs.join(" + ")) + "）" : "";
+    html += '<details class="panel"><summary>🧭 检索统计：轮次 × 检索词 × 数据源' + srcNote + '（点击展开）</summary>' + tmNote + '<table class="stats"><tr><th>轮次</th><th>检索词</th><th>来源</th><th>命中</th><th>耗时(s)</th><th>说明</th></tr>';
+    for (const round of data.retrieval_log) {
+      for (const qr of (round.queries || [])) {
+        const cell = (qr.sources || []).map(s =>
+          s.skipped ? esc(s.source) + " 跳过"
+            : esc(s.source) + " " + s.hits + " 条" + (s.error ? " (错误)" : " · " + s.seconds + "s")).join("，");
+        html += "<tr><td>第" + round.round + "轮" +
+          (qr.classic ? '<br><span class="cla">经典锚点</span>' : "") + "</td><td>" + esc(qr.query) + "</td><td>" + cell +
+          "</td><td>" + (qr.hits || 0) + "</td><td>-</td><td>" + (qr.error ? esc(qr.error) : "新增 " + (round.added || 0)) + "</td></tr>";
+      }
+    }
+    html += "</table></details>";
+  }
+
+  // papers list: search mode already rendered the list at the top; ask mode
+  // shows the working set here (answer anchors [#n] point to these cards)
+  if (data.papers.length && answered) {
+    html += '<details class="panel"><summary>📄 本次工作论文集（' + data.papers.length + ' 篇）· 点击展开' +
+      '<button type="button" class="ghost mini" id="pdfpack" title="把其中可公开获取的 PDF 打包成一个 ZIP，内含文献清单 CSV/BibTeX 与逐篇下载报告；付费墙文献会列出获取链接">⬇ 批量下载 PDF</button>' +
+      '</summary>';
+    data.papers.forEach((p, i) => { html += paperItemHTML(p, i); });
+    html += "</details>";
+  }
+
+  // interactive follow-up: a continuing conversation on this run. It answers
+  // from the working set, and -- when the material is not there -- fetches the
+  // missing papers itself and answers again, instead of ending the session.
+  if (answered && data.papers.length) {
+    html += '<details class="panel" id="chatpanel" open>' +
+      '<summary>💬 追问 ScholarMate（本次工作集 ' + data.papers.length + ' 篇论文）' +
+      '<span class="meta" id="chatcount"></span></summary>' +
+      '<div id="chatlog"></div>' +
+      '<div class="chatex" id="chatex">' +
+        CHAT_EXAMPLES.map(t => '<button type="button" data-ex="' + attr(t) + '">' + esc(t) + '</button>').join("") +
+      '</div>' +
+      '<div class="chatbox">' +
+        '<textarea id="chatin" rows="2" placeholder="继续问：哪几篇是直接实验证据？把结论整理成一段综述？共同局限是什么？换个角度再查一层？（Tab 或 Ctrl/⌘+Enter 发送）"></textarea>' +
+        '<button id="chatsend" type="button">发送</button>' +
+      '</div>' +
+      '<label class="chatopt"><input type="checkbox" id="chatfetch" checked> ' +
+        '🔎 材料不够时自动补检索（新增论文按顺序追加编号，已有 [n] 不变）</label>' +
+      '<div class="meta" id="chathint">这是连续对话：先在本次论文里作答；如果这批论文里确实没有，' +
+      'ScholarMate 会自己补检索后再回答，并把新论文标出来。关掉开关它就只基于现有论文作答。</div>' +
+      '</details>';
+  }
+
+  // pipeline structure, read live from the compiled LangGraph
+  html += "<details class=\'panel\' id=\'graphpanel\'><summary>🔧 查看管线结构</summary>" +
+    "<div class=\'meta\'>读取中…</div></details>";
+  answerBox.innerHTML = html;
+  applyScreeningToCards();
+  wirePdfPackBtn();
+  wireChat(data);
+  renderGraphPanel(data.timings || {});
+}
+
+function renderHistory(list) {
+  const el = $("histlist");
+  setHistCount(list.length);
+  if (!list.length) { el.innerHTML = '<div class="meta">暂无历史记录</div>'; return; }
+  el.innerHTML = list.map(h =>
+    '<div class="histwrap">' +
+    '<div class="histitem"><button onclick="loadHistory(\\'' + h.id + '\\')">查看</button>' +
+    '<button class="ghost" onclick="toggleHistExports(\\'' + h.id + '\\')">⬇ 导出</button>' +
+    '<div><div>' + esc(h.question || "") + '</div>' +
+    '<div class="meta">' + (h.created_at || h.id) + " ｜ " + esc(modeLabel(h.mode)) +
+    " ｜ " + esc(h.sort_label || "") + " ｜ " + esc(h.filters_label || "") +
+    " ｜ 论文 " + (h.paper_count || 0) + " 篇 ｜ " + (h.duration_s || 0) + "s</div></div></div>" +
+    '<div class="hexp" id="hx-' + h.id + '"></div></div>'
+  ).join("");
+}
+
+async function loadHistory(id) {
+  try {
+    const resp = await fetch("/history/" + id);
+    const data = await resp.json();
+    if (data.error) return;
+    window.EX = data.exports || {}; window.BIBTEX = Object.keys(data.per_paper_bibtex || {}).map(k => data.per_paper_bibtex[k]);
+    window.SNAP = JSON.stringify(data);
+    current = data;
+    $("sort").value = data.sort || "relevance";
+    logBox.style.display = "none";
+    if (data.mode === "explore") {
+      // an exploration session has no papers or answer: rebuilding it means
+      // replaying the directions it produced, not a result view
+      chips.innerHTML = "";
+      toolbar.innerHTML = "";
+      renderAudits(data);
+      toolbar.scrollIntoView({behavior: "smooth", block: "start"});
+      return;
+    }
+    answerBox.innerHTML = "";
+    chips.innerHTML = "";
+    setEmptyVisible(false);
+    renderAudits(data);
+    refreshScreening(data.id);
+    toolbar.scrollIntoView({behavior: "smooth", block: "start"});
+  } catch (e) { console.error(e); }
+}
+
+// 逐条导出：点「导出」才去取一次 /export，取回的内容按记录 id 缓存，这样每条
+// 记录都能直接下载，不必先「查看」把结果加载到当前视图
+const HEXP = {};
+
+async function toggleHistExports(id) {
+  const box = $("hx-" + id);
+  if (!box) return;
+  if (box.innerHTML) { box.innerHTML = ""; return; }
+  box.innerHTML = '<span class="meta">生成中…</span>';
+  const j = await fetchExportsById(id);
+  if (!j) { box.innerHTML = '<span class="meta">导出失败：该记录没有可用内容</span>'; return; }
+  HEXP[id] = j;
+  const b = [];
+  const add = (kind, label, suffix, mime, b64) =>
+    b.push('<button class="ghost mini" onclick="histDownload(\\'' + id + '\\',\\'' + kind + '\\',\\'' +
+           id + suffix + '\\',\\'' + mime + '\\',' + (b64 ? "true" : "false") + ')">' + label + '</button>');
+  add('bibtex', 'BibTeX', '.bib', 'text/x-bibtex');
+  add('ris', 'RIS', '.ris', 'application/x-research-info-systems');
+  add('gbt', 'GB/T 7714', '-gbt.txt', 'text/plain;charset=utf-8');
+  add('csl', 'CSL-JSON', '.json', 'application/json');
+  add('papers_csv', '论文清单 CSV', '-papers.csv', 'text/csv;charset=utf-8');
+  add('prisma_csv', 'PRISMA 筛选表', '-prisma.csv', 'text/csv;charset=utf-8');
+  add('prisma_md', '筛选台账 MD', '-prisma.md', 'text/markdown;charset=utf-8');
+  if (j.evidence_csv) add('evidence_csv', '证据评分 CSV', '-evidence.csv', 'text/csv;charset=utf-8');
+  if (j.answer_md) add('answer_md', '回答 MD', '-answer.md', 'text/markdown;charset=utf-8');
+  if (j.answer_docx) add('answer_docx', '回答 Word', '-answer.docx', DOCX_MIME, true);
+  box.innerHTML = b.join("");
+}
+
+function histDownload(id, kind, name, mime, b64) {
+  const j = HEXP[id] || {};
+  if (!j[kind]) { flashMsg("该记录没有这项内容"); return; }
+  const fname = "scholarmate-" + name;
+  if (b64) downloadB64(fname, j[kind], mime); else download(fname, j[kind], mime);
+  flashMsg("已导出 " + fname);
+}
+
+// history lives in a collapsible panel: nothing is fetched until the user opens
+// it, so the page stays light; new runs only flag the collapsed panel as stale
+let histLoaded = false;
+async function refreshHistory() {
+  const box = $("history");
+  if (box && !box.open) { setHistCount(histLoaded ? null : undefined); return; }
+  try {
+    const resp = await fetch("/history");
+    const list = await resp.json();
+    histLoaded = true;
+    renderHistory(list);
+  } catch (e) { $("histlist").innerHTML = '<div class="meta">历史加载失败</div>'; }
+}
+
+function setHistCount(n) {
+  const el = $("histcount");
+  if (!el) return;
+  el.textContent = n === undefined ? "" : (n === null ? "｜有新记录" : "｜共 " + n + " 条");
+}
+
+async function pollJob(id) {
+  while (true) {
+    await new Promise(r => setTimeout(r, 1200));
+    const st = await (await fetch("/status?id=" + encodeURIComponent(id))).json();
+    if (st.status === "running" || st.status === "queued") {
+      stage.textContent = (st.stage || "运行中…") + (st.status === "queued" ? "（排队中）" : "");
+      continue;
+    }
+    stage.textContent = st.stage || "完成";
+    if (st.status === "done") {
+      const data = st.data;
+      window.EX = data.exports || {}; window.SNAP = JSON.stringify(data);
+      current = data;
+      $("sort").value = data.sort || "relevance";
+      rebuildBib();
+      renderAudits(data);
+      refreshScreening(data.id);
+      if (data.log && data.log.length) {
+        logBox.style.display = "block";
+        logBox.textContent = data.log;
+      }
+      refreshHistory();
+    } else if (st.status === "cancelled") {
+      const bits = [];
+      if (st.papers_done) bits.push("已检索到 " + st.papers_done + " 篇论文");
+      if (st.pool_size) bits.push("候选池 " + st.pool_size + " 篇");
+      answerBox.innerHTML = '<div class="panel" id="answerbox"><h2 style="margin-top:0">⏹ 已停止</h2>' +
+        '<div class="meta">已按你的请求中断本次运行' +
+        (bits.length ? "（" + bits.join(" · ") + "）" : "") +
+        "。上面的设置随时可改，改完直接点「" + q_mode_label() +
+        "」就是一次全新运行；想省掉已经跑完的部分，也可以从这里接着跑。</div></div>";
+      if (st.can_resume) answerBox.appendChild(resumeButton(id));
+      if (st.log && st.log.length) { logBox.style.display = "block"; logBox.textContent = st.log; }
+    } else {
+      answerBox.innerHTML = '<p class="error">' + esc(st.error || "运行失败") + "</p>";
+      setEmptyVisible(true);
+      // a failed run keeps its LangGraph checkpoint: offer to carry on from the
+      // last finished node instead of paying for the retrieval again
+      if (st.can_resume) answerBox.appendChild(resumeButton(id));
+      if (st.log && st.log.length) { logBox.style.display = "block"; logBox.textContent = st.log; }
+    }
+    return;
+  }
+}
+
+// the current mode's submit wording, so a stopped run tells the user which
+// button to press next
+function q_mode_label() {
+  const m = document.querySelector('input[name="mode"]:checked').value;
+  return m === "search" ? "检索" : m === "explore" ? "探索" : "提问";
+}
+
+function resumeButton(id) {
+  const cont = document.createElement("button");
+  cont.type = "button";
+  cont.className = "ghost";
+  cont.style.marginTop = "10px";
+  cont.textContent = "⏯ 从断点继续（不重复已完成的阶段）";
+  cont.addEventListener("click", () => resumeJob(id, cont));
+  return cont;
+}
+
+async function resumeJob(id, btnEl) {
+  btnEl.disabled = true;
+  try {
+    const r = await fetch("/resume", {method: "POST", headers: {"Content-Type": "application/json"},
+                                      body: JSON.stringify({id})});
+    const rj = await r.json();
+    if (rj.error) throw new Error(rj.error);
+    btnEl.textContent = "续跑中…";
+    currentJobId = rj.id;
+    setRunning(true);
+    answerBox.innerHTML = "";
+    logBox.style.display = "none";
+    progress.classList.add("visible");
+    await pollJob(rj.id);
+  } catch (e) {
+    btnEl.textContent = "续跑失败：" + (e.message || e);
+    btnEl.disabled = false;
+  } finally {
+    setRunning(false);
+    setTimeout(() => progress.classList.remove("visible"), 800);
+  }
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const question = q.value.trim();
+  if (!question) return;
+  btn.disabled = true;
+  answerBox.innerHTML = "";
+  setEmptyVisible(false);
+  chips.innerHTML = ""; toolbar.innerHTML = ""; logBox.style.display = "none";
+  progress.classList.add("visible");
+  const mode = document.querySelector('input[name="mode"]:checked').value;
+  if (mode === "explore") {
+    // exploration is its own conversational endpoint, not a run
+    try { await exploreStart(question); } finally { btn.disabled = false; }
+    return;
+  }
+  const body = {question, mode, sort: $("sort").value,
+                window: $("window").value, review_only: $("review").checked,
+                venue: $("venue").value.trim(), deep_verify: $("deepverify").checked,
+                tiers: Array.from(document.querySelectorAll("input.tier:checked")).map(b => b.value),
+                keep_others: !!(($("keepothers") || {}).checked),
+                score_evidence: mode === "ask" && $("scoreevidence").checked,
+                screen_retractions: mode === "search" ? $("retraction").checked : null,
+                target_species: mode === "ask" ? (($("species") || {}).value || "") : ""};
+  try {
+    const resp = await fetch("/ask", {method:"POST", headers:{"Content-Type":"application/json"},
+                                      body: JSON.stringify(body)});
+    const j = await resp.json();
+    if (j.error) throw new Error(j.error);
+    currentJobId = j.id;
+    setRunning(true);
+    await pollJob(j.id);
+  } catch (err) {
+    stage.textContent = "请求失败";
+    answerBox.innerHTML = '<p class="error">' + esc(err.message || err) + "</p>";
+  } finally {
+    btn.disabled = false;
+    setRunning(false);
+    setTimeout(() => progress.classList.remove("visible"), 800);
+  }
+});
+loadScoring();
+// 升级前的记录还没有归属（默认谁都看不到，也不再对所有人公开）。不自动划归，
+// 是因为自动认领会把它判给碰巧第一个打开页面的人；交给用户点一下更明确。
+(async function offerLegacyAdopt() {
+  const bar = $("ownerbar");
+  if (!bar) return;
+  try {
+    const j = await (await fetch("/owner")).json();
+    if (!j || !j.legacy) return;
+    bar.style.display = "block";
+    bar.innerHTML = '<span class="meta">本机有 ' + j.legacy +
+      ' 条升级前保存的历史记录（已停止公开显示）。</span>' +
+      '<button class="ghost mini" id="adoptbtn" style="margin-left:8px">接管为我的记录</button>';
+    $("adoptbtn").onclick = async () => {
+      const btn = $("adoptbtn");
+      btn.disabled = true;
+      try {
+        const r = await (await fetch("/owner", {method: "POST"})).json();
+        bar.innerHTML = '<span class="meta">已接管 ' + (r.adopted || 0) +
+          ' 条历史记录，此后仅你可见。</span>';
+        histLoaded = false;
+        refreshHistory();
+      } catch (e) { btn.disabled = false; }
+    };
+  } catch (e) {}
+})();
+const histPanel = $("history");
+if (histPanel) {
+  histPanel.addEventListener("toggle", () => {
+    try { localStorage.setItem("hist_open", histPanel.open ? "1" : "0"); } catch (e) {}
+    if (histPanel.open) refreshHistory();
+  });
+  let remembered = false;
+  try { remembered = localStorage.getItem("hist_open") === "1"; } catch (e) {}
+  if (remembered) histPanel.open = true;  // fires the toggle handler above
+}
+
+// ---- 主题：默认跟随系统，手动切换后记住（浅色适合白天阅读 / 投影，打印自动白底黑字）
+function applyTheme(light, persist) {
+  document.documentElement.classList.toggle("light", !!light);
+  const t = $("theme");
+  if (t) t.textContent = light ? "🌙 深色" : "🌗 浅色";
+  if (persist) { try { localStorage.setItem("theme", light ? "light" : "dark"); } catch (e) {} }
+}
+let themeSaved = null;
+try { themeSaved = localStorage.getItem("theme"); } catch (e) {}
+const prefersLight = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+applyTheme(themeSaved ? themeSaved === "light" : prefersLight, false);
+if ($("theme")) {
+  $("theme").addEventListener("click",
+    () => applyTheme(!document.documentElement.classList.contains("light"), true));
+}
+
+// ---- 键盘流：读了太多 PDF 的人不会想去点鼠标
+document.addEventListener("keydown", (e) => {
+  const tag = (document.activeElement || {}).tagName || "";
+  const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+  if (e.key === "/" && !typing) { e.preventDefault(); q.focus(); return; }
+  if (e.key === "Escape") { q.value = ""; q.blur(); return; }
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !btn.disabled) {
+    if (form.requestSubmit) form.requestSubmit();
+    else form.dispatchEvent(new Event("submit", {cancelable: true}));
+  }
+});
+
+// ---- 长结果页的回到顶部
+const toTop = $("totop");
+if (toTop) {
+  toTop.addEventListener("click", () => window.scrollTo({top: 0, behavior: "smooth"}));
+  window.addEventListener("scroll", () => toTop.classList.toggle("show", window.scrollY > 600));
+}
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _identity(self):
+        """This browser's owner token, minted the first time it is needed.
+
+        Anonymous on purpose: one opaque cookie per browser keeps two people's
+        runs apart without making anyone sign in, and it is the seam a real
+        account would slot into later.
+        """
+        owner = getattr(self, "_owner", None)
+        if owner is None:
+            owner = (_cookie_owner(self.headers.get("Cookie") or "")
+                     or secrets.token_hex(16))
+            self._owner = owner
+            self._owner_is_new = True
+        return owner
+
+    # No request here is a long poll: /ask answers 202 at once and the frontend
+    # polls /status, so a socket that has stopped talking is a dead one. Without
+    # a timeout it would hold its thread -- and, now that connections are capped,
+    # one of the 128 slots -- forever, which is the one way a client could
+    # wedge the accept loop. 30s is far longer than any answer this UI waits for.
+    timeout = 30
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
+        elif self.path.startswith("/history/"):
+            name = self.path[len("/history/"):]
+            if not re.fullmatch(r"[\w.\-]+", name):
+                self._send(404, "application/json", b'{"error":"not found"}')
+                return
+            job = _get_job(name[:-5] if name.endswith(".json") else name, self._identity())
+            if job is None:
+                self._send(404, "application/json", b'{"error":"not found"}')
+                return
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps(job, ensure_ascii=False).encode("utf-8"))
+        elif self.path == "/history":
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps(_history_index(self._identity()),
+                                  ensure_ascii=False).encode("utf-8"))
+        elif self.path == "/owner":
+            # how many runs predate owners and are waiting to be adopted
+            self._send(200, "application/json; charset=utf-8",
+                       json.dumps({"legacy": jobstore.legacy_count()},
+                                  ensure_ascii=False).encode("utf-8"))
+        elif self.path.startswith("/scoring"):
+            saved = scoring.load_settings()
+            body = json.dumps({
+                "dimensions": scoring.dimensions_payload(),
+                "presets": scoring.presets_payload(),
+                "weights": scoring.normalize_weights(saved["weights"], saved["target_species"]),
+                "target_species": saved.get("target_species", ""),
+                "preset": saved.get("preset", "balanced"),
+                "grades": [{"min": g[0], "label": g[1], "cls": g[2]} for g in scoring.GRADES],
+                "max_papers": scoring.MAX_PAPERS,
+            }, ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif self.path.startswith("/screening"):
+            run_id = ""
+            if "?" in self.path:
+                params = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+                run_id = (params.get("run") or [""])[0]
+            if run_id and _get_job(run_id, self._identity()) is None:
+                self._send(404, "application/json",
+                           json.dumps({"error": "not found"}).encode("utf-8"))
+                return
+            if not run_id:
+                self._send(400, "application/json",
+                           json.dumps({"error": "missing run id"}).encode("utf-8"))
+                return
+            body = json.dumps(screening.payload(run_id), ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif self.path == "/graph":
+            # topology of the compiled LangGraph, read at runtime so the page
+            # can never show a diagram that no longer matches the execution
+            body = json.dumps(graph.describe_graph(), ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        else:
+            self._send(404, "text/plain; charset=utf-8", b"not found")
+
+    def do_POST(self):
+        if self.path != "/ask":
+            self._send(404, "text/plain; charset=utf-8", b"not found")
+            return
+        self._ask(self._read_json())
+
+    def _read_json(self):
+        """Read the request body exactly once.
+
+        Every POST path must go through this: the body is a stream, so a second
+        read() returns nothing and blocks until the client times out.
+        """
+        length = int(self.headers.get("Content-Length", 0))
+        if not length:
+            return {}
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _ask(self, payload):
+        if payload is None:
+            self._send(400, "application/json",
+                       json.dumps({"error": "bad request"}).encode("utf-8"))
+            return
+        try:
+            question = payload.get("question", "").strip()
+            mode = payload.get("mode", "ask")
+            if mode not in ("ask", "search"):
+                mode = "ask"
+            sort = payload.get("sort", "relevance")
+            if sort not in graph.SEARCH_SORTS:
+                sort = "relevance"
+            filters = _filters_from_payload(payload)
+            deep_verify = bool(payload.get("deep_verify", True))
+            # evidence scoring is ask-mode only; search stays a plain listing
+            score_evidence = bool(payload.get("score_evidence", False)) and mode == "ask"
+            # None = keep the mode default (on for answers, off for search)
+            screening = payload.get("screen_retractions")
+            screen_retractions = None if screening is None else bool(screening)
+            target_species = str(payload.get("target_species") or "").strip()
+            saved = scoring.load_settings()
+            weights = scoring.normalize_weights(
+                payload.get("weights") or saved["weights"],
+                target_species or saved.get("target_species", ""),
+            )
+            if not target_species:
+                target_species = saved.get("target_species", "")
+        except Exception:
+            self._send(400, "application/json",
+                       json.dumps({"error": "bad request"}).encode("utf-8"))
+            return
+        if not question:
+            self._send(400, "application/json",
+                       json.dumps({"error": "empty question"}).encode("utf-8"))
+            return
+        job_id = _job_id()
+        job = {
+            "id": job_id,
+            "thread_id": job_id,          # LangGraph checkpoint thread
+            "question": question, "mode": mode, "sort": sort, "filters": filters,
+            "deep_verify": deep_verify, "score_evidence": score_evidence,
+            "screen_retractions": screen_retractions,
+            "weights": weights, "target_species": target_species,
+            "status": "queued", "stage": "排队中…", "log": [], "stages": [],
+        }
+        _enqueue(job, self._identity())
+        self._send(202, "application/json",
+                   json.dumps({"id": job["id"], "status": "queued"}).encode("utf-8"))
+
+    def _explore(self, payload):
+        """The field-exploration endpoint.
+
+        action=scope   start a session: split a field into directions
+        action=deepen  drill into one chosen direction (same session)
+        action=survey  turn the chosen directions into a review run
+
+        The first two answer with directions; the third queues an ordinary
+        `mode="survey"` run, so the report it produces is verified, exported
+        and follow-up-able exactly like any other answer.
+        """
+        if payload is None:
+            self._send(400, "application/json", b'{"error":"bad request"}')
+            return
+        action = str(payload.get("action") or "scope").strip()
+        if action not in ("scope", "deepen", "survey"):
+            self._send(400, "application/json", json.dumps(
+                {"error": f"未知操作：{action}"}, ensure_ascii=False).encode("utf-8"))
+            return
+        topic = str(payload.get("topic") or "").strip()[:600]
+        direction = payload.get("direction") if isinstance(payload.get("direction"), dict) else {}
+        path = [str(x)[:80] for x in (payload.get("path") or []) if str(x).strip()][-12:]
+        seen = [str(x)[:80] for x in (payload.get("seen") or []) if str(x).strip()][-80:]
+
+        if action == "survey":
+            chosen = [d for d in (payload.get("directions") or [])
+                      if isinstance(d, dict) and str(d.get("name") or "").strip()]
+            if not topic:
+                topic = str(payload.get("question") or "").strip()[:600]
+            if not topic or not chosen:
+                self._send(400, "application/json", json.dumps(
+                    {"error": "请先选择至少一个方向，再生成综述报告"},
+                    ensure_ascii=False).encode("utf-8"))
+                return
+            try:
+                screening = payload.get("screen_retractions")
+                saved = scoring.load_settings()
+                weights = scoring.normalize_weights(
+                    payload.get("weights") or saved["weights"],
+                    str(payload.get("target_species") or saved.get("target_species", "")),
+                )
+            except Exception:
+                weights = {}
+            job_id = _job_id()
+            job = {
+                "id": job_id, "thread_id": job_id,
+                "question": topic, "mode": "survey", "sort": "relevance",
+                "filters": _filters_from_payload(payload),
+                "deep_verify": bool(payload.get("deep_verify", True)),
+                "score_evidence": bool(payload.get("score_evidence", True)),
+                "screen_retractions": None if screening is None else bool(screening),
+                "weights": weights,
+                "target_species": str(payload.get("target_species") or "").strip(),
+                "directions": chosen[:12], "path": path,
+                "status": "queued", "stage": "排队中…", "log": [], "stages": [],
+            }
+            _enqueue(job, self._identity())
+            self._send(202, "application/json", json.dumps(
+                {"id": job["id"], "run_id": job["id"], "mode": "survey", "status": "queued"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+
+        if action == "deepen" and not str(direction.get("name") or "").strip():
+            self._send(400, "application/json", json.dumps(
+                {"error": "请指明要深入的方向"}, ensure_ascii=False).encode("utf-8"))
+            return
+        if not topic:
+            topic = str(direction.get("name") or "").strip()[:600]
+        if not topic:
+            self._send(400, "application/json", json.dumps(
+                {"error": "请输入想调研的领域"}, ensure_ascii=False).encode("utf-8"))
+            return
+
+        rid = str(payload.get("id") or "").strip()
+        if rid and _get_job(rid, self._identity()) is None:
+            # the session belongs to another browser (or is a pre-owner record
+            # waiting to be adopted): do not let a guessed id extend it
+            self._send(404, "application/json", json.dumps(
+                {"error": "找不到这次探索会话（可能已被清理，或属于其他用户），可以重新开始领域探索"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+        if action == "deepen" and not rid:
+            self._send(404, "application/json", json.dumps(
+                {"error": "会话已过期，请重新开始领域探索"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+
+        job_id = _job_id()
+        run_id = rid or job_id          # the first turn *is* the session record
+        if action == "deepen" and not path:
+            # the caller normally sends the whole breadcrumb; a bare deepen
+            # still gets a sensible path instead of an empty one
+            path = [str(direction.get("name") or "").strip()]
+        job = {
+            "id": job_id, "thread_id": job_id, "run_id": run_id,
+            "question": topic, "action": action, "direction": direction,
+            "path": path, "seen": seen,
+            "preview": bool(payload.get("preview", True)),
+            "mode": "explore", "status": "queued", "stage": "排队中…",
+            "log": [], "stages": [],
+        }
+        if action == "scope":
+            # materialise the empty session now, so the first turn always has a
+            # record to append to and the session shows up in history even if
+            # this turn fails
+            path_existed = os.path.exists(_run_path(run_id))
+            try:
+                atomicio.write_json(_run_path(run_id), {
+                    "id": run_id,
+                    "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "question": topic, "mode": "explore",
+                    "papers": [], "answer": "", "explore": [],
+                })
+            except OSError:
+                pass
+        _enqueue(job, self._identity())
+        self._send(202, "application/json", json.dumps(
+            {"id": job["id"], "run_id": run_id, "mode": "explore", "status": "queued"},
+            ensure_ascii=False).encode("utf-8"))
+
+    def _resume(self, payload):
+        """Queue a failed run again, continuing from its last checkpoint."""
+        jid = str((payload or {}).get("id") or "")
+        old = _get_job(jid, self._identity())
+        if old is None:
+            self._send(404, "application/json",
+                       json.dumps({"error": "任务表里没有这个 id"},
+                                  ensure_ascii=False).encode("utf-8"))
+            return
+        thread_id = old.get("thread_id") or jid
+        if not graph.has_checkpoint(thread_id):
+            self._send(400, "application/json", json.dumps(
+                {"error": "该任务没有可续跑的断点：要么它已完成，要么断点已被后续运行挤出内存"
+                          f"（最多保留 {graph.MAX_THREADS} 个）"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+        job = {k: old.get(k) for k in ("question", "mode", "sort", "filters", "deep_verify",
+                                       "directions",
+                                       "score_evidence", "weights", "target_species",
+                                       "screen_retractions")}
+        job.update({"id": _job_id(), "thread_id": thread_id, "resume_thread": thread_id,
+                    "status": "queued", "stage": "排队中…（断点续跑）", "log": [], "stages": []})
+        _enqueue(job, self._identity())
+        self._send(202, "application/json",
+                   json.dumps({"id": job["id"], "status": "queued", "resumed": True},
+                              ensure_ascii=False).encode("utf-8"))
+
+    def _send(self, code, ctype, body, headers=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or []):
+            self.send_header(name, value)
+        if getattr(self, "_owner_is_new", False):
+            self._owner_is_new = False
+            self.send_header("Set-Cookie", _owner_cookie(self._owner))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def _status_payload(job):
+    base = {"id": job["id"], "status": job["status"], "stage": job.get("stage", ""),
+            "log": "\n".join(job.get("log") or [])}
+    base["can_cancel"] = job["status"] in ("queued", "running")
+    if job["status"] == "cancelled":
+        # partial progress at the moment of the stop (from the checkpoint)
+        base.update({k: job.get(k) for k in ("papers_done", "pool_size", "rounds_done")})
+    if job["status"] in ("done", "error"):
+        # every key the frontend reads off `data` has to be listed here --
+        # timings / retraction / sources were missing, so the pipeline panel's
+        # per-node times, the retraction chip and the source list stayed empty
+        keys = ("id", "created_at", "question", "mode", "sort", "sort_label", "filters",
+                "filters_label", "duration_s", "answer", "papers", "retrieval_log",
+                "scores", "audits", "counts", "exports", "per_paper_bibtex", "reports",
+                "evidence", "timings", "retraction", "sources", "deep_verify", "chat",
+                "directions", "explore_path", "tier_filter")
+        if job.get("mode") == "chat":
+            keys = ("id", "run_id", "mode", "question", "duration_s", "chat_turn",
+                    "chat_papers")
+        elif job.get("mode") == "explore":
+            keys = ("id", "run_id", "mode", "question", "duration_s",
+                    "explore_turn", "explore")
+        data = {k: job.get(k) for k in keys}
+        base["data"] = data
+        base["error"] = job.get("error")
+    # a failed run can be picked up where it stopped (checkpoint still in memory)
+    thread_id = job.get("thread_id") or job.get("id")
+    base["thread_id"] = thread_id
+    base["can_resume"] = bool(job["status"] in ("error", "cancelled")
+                              and graph.has_checkpoint(thread_id))
+    return base
+
+
+def _rerank_payload(d):
+    """Minimal finished-job payload rebuilt after an in-place re-score."""
+    return {k: d.get(k) for k in (
+        "id", "question", "mode", "sort", "sort_label", "filters",
+        "filters_label", "duration_s", "answer", "papers", "retrieval_log",
+        "scores", "exports", "per_paper_bibtex", "evidence",
+    )}
+
+
+def _load_job_or_snapshot(jid, owner=None):
+    """The finished job record, rebuilt from the snapshot file when the table
+    does not have it (the snapshots predate the table), or None when neither
+    has it -- or when it belongs to somebody else."""
+    job = _get_job(jid, owner)
+    if job is not None and (job.get("papers") or []):
+        return job
+    if owner is not None and jobstore.get(jid) is not None:
+        # the run exists but is filed under another browser. The snapshot file
+        # carries no owner, so falling back to it here would hand the record to
+        # anyone who guesses an id -- which is the leak this whole change is
+        # about. Refuse instead.
+        return None
+    path = os.path.join(HISTORY_DIR, jid + ".json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            snap = json.load(f)
+    except Exception:
+        return None
+    if not (snap.get("papers") or []):
+        return None
+    return {
+        "id": jid, "question": snap.get("question", ""),
+        "papers": snap.get("papers") or [], "mode": snap.get("mode", "ask"),
+        "filters": snap.get("filters") or {},
+        # kept so the answer can be re-rendered as Markdown / Word after a restart
+        "answer": snap.get("answer") or "",
+    }
+
+
+def _ordered_papers(job, order):
+    """A run's papers in the caller's display order, falling back to the run's
+    own order when no (or no matching) titles are supplied."""
+    lookup = {}
+    for p in job.get("papers") or []:
+        if p.get("title"):
+            lookup.setdefault(p["title"], p)
+    return [lookup[t] for t in order if t in lookup] or list(lookup.values())
+
+
+def _answer_markdown(job):
+    """The finished answer as a standalone Markdown document.
+
+    Answers already open with their own `# title`; search-mode results start at
+    `## ...`, so the question is prepended there to give the document a title.
+    """
+    answer = (job.get("answer") or "").strip()
+    if not answer:
+        return ""
+    question = (job.get("question") or "").strip()
+    if question and not re.match(r"^#\s+\S", answer):
+        return "# " + question + "\n\n" + answer
+    return answer
+
+
+def _exports_in_order(jid, order, only=None, owner=None):
+    """Regenerate the bulk exports in a caller-supplied title order.
+
+    `only` narrows the exported set to a screening decision ("include",
+    "exclude", "maybe") or to "undecided"/"screened"; the PRISMA ledger always
+    covers the whole display order so the table stays reproducible.
+    """
+    job = _load_job_or_snapshot(jid, owner)
+    if job is None:
+        return None
+    all_papers = _ordered_papers(job, order)
+    store = screening.load(jid)
+    selected = screening.filter_papers(all_papers, store, only)
+    # an `only` filter that matches nothing is an error for the caller; a run
+    # with no papers but a written answer still has something to export
+    answer_md = _answer_markdown(job)
+    if (only and not selected) or (not selected and not answer_md):
+        return None
+    result = {
+        "bibtex": exports.bibtex(selected),
+        "ris": exports.ris(selected),
+        "gbt": exports.gbt7714(selected),
+        "csl": exports.csl_json(selected),
+        "count": len(selected),
+        "papers_csv": exports.papers_csv(selected, store) if selected else "",
+        "prisma_csv": exports.prisma_csv(all_papers, store),
+        "prisma_md": exports.prisma_markdown(all_papers, store,
+                                             job.get("question", ""), jid),
+        "prisma_counts": exports._decision_counts(all_papers, store),
+        "screening_total": len(all_papers),
+        "evidence_csv": (exports.evidence_csv(selected, scoring.dimensions_payload())
+                         if any(p.get("evidence") for p in selected) else ""),
+        "answer_md": answer_md,
+        # .docx is a binary zip, so it rides the JSON channel as base64
+        "answer_docx": (base64.b64encode(docexport.markdown_to_docx(answer_md)).decode("ascii")
+                        if answer_md else ""),
+    }
+    return result
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard ceiling on concurrent connections.
+
+    ThreadingHTTPServer spawns one thread per connection and never stops: a few
+    browsers polling for status is fine, but nothing bounds the count, so one
+    client -- or a tab left open in a loop -- can grow the thread list until the
+    box swaps. Acquiring a slot *before* spawning the thread turns that into
+    backpressure: the accept loop waits, extra connections sit in the listen
+    backlog and are refused once it fills, which fails fast instead of
+    degrading every other user's latency.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 64
+
+    def __init__(self, server_address, handler, max_connections=MAX_CONNECTIONS):
+        self._slots = threading.BoundedSemaphore(max_connections)
+        self.max_connections = max_connections
+        super().__init__(server_address, handler)
+
+    def process_request(self, request, client_address):
+        self._slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # the thread never started, so nobody will release the slot for us
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ScholarMate web UI")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+
+    class StatusHandler(Handler):
+        def do_GET(self):
+            if self.path.startswith("/status?id="):
+                jid = self.path[len("/status?id="):]
+                job = _get_job(jid, self._identity())
+                if job is None:
+                    self._send(404, "application/json", b'{"error":"unknown job"}')
+                    return
+                body = json.dumps(_status_payload(job), ensure_ascii=False).encode("utf-8")
+                self._send(200, "application/json; charset=utf-8", body)
+                return
+            super().do_GET()
+
+        def do_POST(self):
+            payload = self._read_json() if self.path != "/ask" else {}
+            if self.path == "/screening":
+                self._screening(payload)
+                return
+            if self.path == "/owner":
+                # one-shot: the visitor claims the runs that predate owners
+                self._send(200, "application/json", json.dumps(
+                    {"adopted": jobstore.adopt_legacy(self._identity())},
+                    ensure_ascii=False).encode("utf-8"))
+                return
+            if self.path == "/scoring":
+                self._scoring(payload)
+                return
+            if self.path == "/resume":
+                self._resume(payload)
+                return
+            if self.path == "/cancel":
+                code, body = _cancel_job(str((payload or {}).get("id") or "").strip(),
+                                         self._identity())
+                self._send(code, "application/json",
+                           json.dumps(body, ensure_ascii=False).encode("utf-8"))
+                return
+            if self.path == "/ask":
+                # /ask reads its own body through the handler below
+                super().do_POST()
+                return
+            if payload is None:
+                self._send(400, "application/json",
+                           json.dumps({"error": "bad request"}).encode("utf-8"))
+                return
+            jid = payload.get("id", "")
+            if self.path == "/export":
+                order = payload.get("order") or []
+                result = _exports_in_order(jid, order, only=payload.get("only") or None,
+                                           owner=self._identity())
+                if result is None:
+                    self._send(404, "application/json",
+                               json.dumps({"error": "no matching search results"}).encode("utf-8"))
+                    return
+                self._send(200, "application/json",
+                           json.dumps({"ok": True, **result}, ensure_ascii=False).encode("utf-8"))
+                return
+            if self.path == "/explore":
+                self._explore(payload)
+                return
+            if self.path == "/chat":
+                rid = str(payload.get("id") or "")
+                message = str(payload.get("message") or "").strip()[:4000]
+                if not message:
+                    self._send(400, "application/json",
+                               json.dumps({"error": "请输入追问内容"}, ensure_ascii=False).encode("utf-8"))
+                    return
+                parent = _load_job_or_snapshot(rid, self._identity())
+                if parent is None or not (parent.get("papers") or []):
+                    self._send(404, "application/json", json.dumps(
+                        {"error": "找不到这次运行的论文（仅智能问答支持追问）"},
+                        ensure_ascii=False).encode("utf-8"))
+                    return
+                if parent.get("mode") != "ask":
+                    self._send(400, "application/json", json.dumps(
+                        {"error": "追问只在智能问答模式下可用"}, ensure_ascii=False).encode("utf-8"))
+                    return
+                if jobstore.active_chat_run(rid):
+                    self._send(409, "application/json", json.dumps(
+                        {"error": "上一轮追问还在回答中"}, ensure_ascii=False).encode("utf-8"))
+                    return
+                job_id = _job_id()
+                chat_job = {
+                    "id": job_id, "thread_id": job_id, "run_id": rid,
+                    "message": message, "question": message, "mode": "chat",
+                    "allow_retrieve": bool(payload.get("allow_retrieve", True)),
+                    "status": "queued", "stage": "排队中…", "log": [], "stages": [],
+                }
+                _enqueue(chat_job, self._identity())
+                self._send(202, "application/json",
+                           json.dumps({"id": job_id, "status": "queued"},
+                                      ensure_ascii=False).encode("utf-8"))
+                return
+            if self.path == "/pdfpack":
+                # synchronous (bounded by pdfpack.BUDGET_S): the browser shows
+                # an elapsed timer while it waits, then saves the returned blob
+                job = _load_job_or_snapshot(jid, self._identity())
+                papers = _ordered_papers(job, payload.get("order") or []) if job else []
+                if not papers:
+                    self._send(404, "application/json",
+                               json.dumps({"error": "no matching search results"},
+                                          ensure_ascii=False).encode("utf-8"))
+                    return
+                data, summary = pdfpack.build_zip(papers, screening.load(jid),
+                                                  job.get("question", ""), jid)
+                self._send(200, "application/zip", data, headers=[
+                    ("Content-Disposition",
+                     'attachment; filename="scholarmate-%s-pdfs.zip"' % jid),
+                    ("X-Paper-Count", str(summary["total"])),
+                    ("X-Pdf-Count", str(summary["pdfs"])),
+                ])
+                return
+            if self.path != "/rerank":
+                self._send(404, "text/plain; charset=utf-8", b"not found")
+                return
+            job = _get_job(jid, self._identity())
+            if job is None or job.get("mode") != "search":
+                # result may only exist as a persisted snapshot (server restart)
+                path = os.path.join(HISTORY_DIR, jid + ".json")
+                if os.path.exists(path):
+                    try:
+                        with open(path, encoding="utf-8") as f:
+                            snap = json.load(f)
+                        if snap.get("mode") == "search":
+                            job = {
+                                "id": jid, "question": snap.get("question", ""),
+                                "papers": snap.get("papers") or [], "mode": "search",
+                                "filters": snap.get("filters") or {},
+                            }
+                    except Exception:
+                        job = None
+            if job is None or job.get("mode") != "search" or not (job.get("papers") or []):
+                self._send(400, "application/json",
+                           json.dumps({"error": "no completed search result for this id"}).encode("utf-8"))
+                return
+            ok = _rerank_existing(job)
+            if not ok:
+                self._send(500, "application/json",
+                           json.dumps({"error": job.get("rerank_error") or "rerank failed"}).encode("utf-8"))
+                return
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "id": jid, "data": _rerank_payload(job)},
+                                  ensure_ascii=False).encode("utf-8"))
+
+        def _scoring(self, payload):
+            """Persist the user's per-dimension weights and target species."""
+            if payload is None:
+                self._send(400, "application/json",
+                           json.dumps({"error": "bad request"}).encode("utf-8"))
+                return
+            saved = scoring.save_settings(
+                payload.get("weights") or {},
+                str(payload.get("target_species") or ""),
+                str(payload.get("preset") or "custom"),
+            )
+            self._send(200, "application/json", json.dumps({
+                "ok": True, "weights": saved["weights"],
+                "target_species": saved["target_species"], "preset": saved["preset"],
+            }, ensure_ascii=False).encode("utf-8"))
+
+        def _screening(self, payload):
+            """Record one 纳入/排除/待定 decision (or clear it) for one paper."""
+            payload = payload or {}
+            if not isinstance(payload, dict):
+                self._send(400, "application/json",
+                           json.dumps({"error": "bad request"}).encode("utf-8"))
+                return
+            run_id = str(payload.get("run") or "").strip()
+            key = str(payload.get("key") or "").strip()
+            if not run_id or not key:
+                self._send(400, "application/json",
+                           json.dumps({"error": "run and key are required"}).encode("utf-8"))
+                return
+            if _get_job(run_id, self._identity()) is None:
+                self._send(404, "application/json",
+                           json.dumps({"error": "not found"}).encode("utf-8"))
+                return
+            decision = str(payload.get("decision") or "")
+            if decision not in screening.DECISIONS:
+                decision = ""
+            summary = screening.record(
+                run_id, key, decision,
+                reason=str(payload.get("reason") or ""),
+                note=str(payload.get("note") or ""),
+                title=str(payload.get("title") or ""),
+            )
+            self._send(200, "application/json", json.dumps({
+                "ok": True, "run": run_id, "key": key, "decision": decision,
+                "summary": summary, "decisions": screening.load(run_id),
+            }, ensure_ascii=False).encode("utf-8"))
+
+    server = BoundedThreadingHTTPServer((args.host, args.port), StatusHandler)
+    print(f"ScholarMate running at http://{args.host}:{args.port} "
+          f"(Ctrl+C to stop; 并发连接上限 {server.max_connections})")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
