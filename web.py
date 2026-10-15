@@ -28,6 +28,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import atomicio
+import citationgraph
 import docexport
 import exports
 import graph
@@ -1052,7 +1053,37 @@ PAGE = """<!DOCTYPE html>
     #answerbox { font-size:14px; }
     table.stats { display:block; overflow-x:auto; white-space:nowrap; }
     .histitem { align-items:flex-start; }
+    .gwrap { flex-direction:column; }
+    .gside { flex:1 1 auto; width:auto; max-height:none; }
+    .gmap { height:min(58vh,420px); }
   }
+  /* 文献关系图谱（connected-papers 式）：左边画布 + 右边榜单 */
+  .gctl { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+  .gctl .slab { color:var(--muted); font-size:12.5px; }
+  .grow { margin:5px 0; }
+  .gwrap { display:flex; gap:12px; align-items:stretch; margin-top:10px; }
+  .gmap { flex:1 1 auto; min-width:0; height:min(70vh,560px);
+          border:1px solid var(--line); border-radius:10px;
+          background:var(--sunk); overflow:hidden; }
+  .gmap svg { display:block; width:100%; height:100%; cursor:grab; touch-action:none; }
+  .gnode { cursor:pointer; }
+  .gnode.sel circle { stroke-width:3.5; }
+  .glab { font-size:9px; fill:var(--muted); pointer-events:none; }
+  .gside { flex:0 0 300px; width:300px; max-height:min(70vh,560px); overflow:auto;
+           padding:10px; border:1px solid var(--line); border-radius:10px;
+           background:var(--card); }
+  .gside h4 { margin:12px 0 2px; font-size:12.5px; }
+  .gdetail { padding:8px; margin-bottom:8px; border:1px solid var(--line);
+             border-radius:8px; }
+  .glegend { margin-top:6px; padding-top:8px; border-top:1px solid var(--line); }
+  .gyear { height:10px; margin:6px 0 4px; border-radius:5px;
+           background:linear-gradient(90deg,#1e6bff,#e11d48); }
+  .glist { margin:0; padding:0; list-style:none; }
+  .glist li { padding:3px 6px; border-radius:6px; font-size:12.5px;
+              line-height:1.35; cursor:pointer; }
+  .glist li:hover { background:var(--hover); }
+  .glist li.sel { background:var(--hover); box-shadow:inset 2px 0 0 var(--accent); }
+  .glist .gm { font-size:11px; color:var(--muted); }
   /* 打印 / 存 PDF 精读：去掉交互件、白底黑字、卡片不跨页断开 */
   @media print {
     :root { --bg:#fff; --card:#fff; --field:#fff; --sunk:#fafafa; --line:#ccc; --line2:#ccc;
@@ -1156,8 +1187,15 @@ const chips = $("chips"), toolbar = $("toolbar");
 let current = null;      // last completed result payload (for local re-sorting)
 let relevancePending = false;
 let currentJobId = null; // job the ⏹ button would stop ("/cancel" target)
+// 每个模式各自记住自己上一次展示的东西，切模式时看到的是这个模式自己的结果，而不是
+// 上一个模式留下的结果（曾经：在「仅搜索论文」里检索完切回「智能问答」，看到的还是
+// 那一列论文）。一次领域探索产出的综述报告带着 mode="survey"，但它是 explore 的视图，
+// 所以按「属于哪套视图」归类，而不是按 payload 自己的 mode；谁最近被展示谁留在记忆里。
+const LAST_BY_MODE = {ask: null, search: null, explore: null};
+let runInFlight = false;  // 运行中不换视图：结果出来时 pollJob 自己会渲染
 
 function setRunning(on) {
+  runInFlight = !!on;
   const stop = $("stop");
   if (stop) {
     stop.style.display = on ? "" : "none";
@@ -1213,7 +1251,10 @@ function syncMode() {
   }
   btn.textContent = mode === "search" ? "检索" : "提问";
 }
-document.querySelectorAll('input[name="mode"]').forEach(r => r.addEventListener("change", syncMode));
+// 换模式做两件事：把只属于该模式的选项行亮出来（syncMode），以及把视图切到该模式
+// 自己上一次的结果（modeSwitched）——后者是「切回智能问答还看到检索列表」的修复
+document.querySelectorAll('input[name="mode"]').forEach(r =>
+  r.addEventListener("change", () => { syncMode(); modeSwitched(); }));
 
 syncMode();
 $("stop").addEventListener("click", stopRun);
@@ -1246,6 +1287,8 @@ document.addEventListener("click", (e) => {
   const ex = t.closest(".qex");
   if (ex) { q.value = ex.getAttribute("data-q") || ""; q.focus(); return; }
   if (t.closest("#totop")) { window.scrollTo({top:0, behavior:"smooth"}); return; }
+  const gb = t.closest(".gbtn");
+  if (gb) { showGraphPanel(gb.getAttribute("data-gseed") || ""); return; }
   const b = t.closest(".evbtn");
   if (!b) return;
   const body = b.parentElement ? b.parentElement.querySelector(".evbody") : null;
@@ -2038,7 +2081,7 @@ function paperItemHTML(p, i) {
     "<div class='meta'>作者：" + esc((p.authors || []).join("; ") || "未知") + "</div>" +
     (p.abstract ? "<div class='meta abs' title='点击展开 / 收起摘要'>" + esc(p.abstract) + "</div>" : "") +
     '<div class="links">' + paperLinks(p, i) + "</div>" +
-    evidenceHTML(p) + screeningRowHTML(p) + "</div>";
+    evidenceHTML(p) + screeningRowHTML(p) + graphRowHTML(p) + "</div>";
   return s;
 }
 
@@ -2047,6 +2090,681 @@ function paperListHTML(data) {
     data.papers.length + ' 篇论文（排序：' + esc(data.sort_label || "相关性") + '）</h2>';
   data.papers.forEach((p, i) => { s += paperItemHTML(p, i); });
   return s + "</div>";
+}
+
+// ------------------------------------------------------------ 文献关系图谱
+// 把一篇论文放回它的引用网络里（后端 citationgraph.py）：先行 = 它引用的，后续 =
+// 引用它的，相似度 = 两篇论文共同引用了多少篇文献。布局在浏览器里算：耦合边相吸
+// （越像越近）、所有节点相斥、年份决定纵向位置，所以「老文献在上、新文献在下」，
+// 同一片工作自然聚成一团。拖动、缩放、重排都不回服务器。
+const GRAPH = {data: null, pos: null, view: {k: 1, x: 0, y: 0}, sel: null,
+               mode: "year", busy: false, drag: null, wired: false, info: {}};
+
+function graphSeedOf(p) {
+  // a DOI is the only exact handle OpenAlex needs; the title is the fallback
+  return String((p && (p.doi || p.title)) || "");
+}
+
+function graphRowHTML(p) {
+  const seed = graphSeedOf(p);
+  if (!seed) return "";
+  return '<div class="grow"><button type="button" class="ghost mini gbtn" data-gseed="' +
+    attr(seed) + '" title="把这篇论文放回引用网络：它引用了谁、谁引用了它、和谁最像">' +
+    "🕸 关系图谱</button></div>";
+}
+
+function yearColor(t) {                     // 0 = 最早（蓝）.. 1 = 最新（红）
+  const h = 220 - 200 * Math.max(0, Math.min(1, t));
+  return "hsl(" + h.toFixed(0) + ",72%,52%)";
+}
+
+// 稳定的小哈希（FNV-1a）：同一个 id 永远得到同一个数。布局的初值和退化偏移
+// 都由它决定，而不是由数组下标决定——否则「这篇论文排在第几」会悄悄影响成图，
+// 而数组顺序恰好和年份相关（先行/后续各自按相关性排），于是「按相似度」重排时
+// 纵向又会透出年份，看起来像没换模式。
+function graphHash(s) {
+  let h = 2166136261;
+  s = String(s == null ? "" : s);
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = (h * 16777619) >>> 0; }
+  return h >>> 0;
+}
+
+// 力导向布局。O(n^2) 的斥力在 70-120 个节点、几百次迭代的量级是几十毫秒，
+// 不值得为它引入依赖或做四叉树。
+function graphLayout(g, mode) {
+  const W = 960, H = 640, cx = W / 2;
+  const nodes = g.nodes || [], idx = {};
+  nodes.forEach((n, i) => { idx[n.id] = i; });
+  const yr = (g.year_range && g.year_range.length === 2) ? g.year_range : [2020, 2020];
+  const span = Math.max(1, yr[1] - yr[0]);
+  const yearT = n => (n.year ? Math.max(0, Math.min(1, (n.year - yr[0]) / span)) : 0.5);
+  const yearY = n => (mode === "year" ? H * 0.10 + H * 0.80 * yearT(n) : H / 2);
+  // 初值：种子在正中，先行/后续分列两侧，按年份排纵向，用 id 哈希散开避免初始重叠
+  const pos = nodes.map((n, i) => {
+    if (n.role === "seed") return {x: cx, y: H / 2, vx: 0, vy: 0, fixed: true};
+    const ang = (graphHash(n.id) % 1000) / 1000 * 6.283185307179586;
+    const side = n.role === "prior" ? -1 : 1;
+    return {x: cx + side * (150 + 120 * Math.abs(Math.cos(ang))),
+            y: yearY(n) + 46 * Math.sin(ang), vx: 0, vy: 0};
+  });
+  const links = (g.edges || []).filter(e => e.kind === "coupled")
+    .map(e => ({a: idx[e.source], b: idx[e.target], w: Math.min(e.weight || 1, 10)}))
+    .filter(l => l.a != null && l.b != null);
+  const iters = 360;
+  for (let it = 0; it < iters; it++) {
+    const cool = 1 - it / iters * 0.85;
+    for (let i = 0; i < pos.length; i++) {
+      const A = pos[i];
+      for (let j = i + 1; j < pos.length; j++) {
+        const B = pos[j];
+        let dx = A.x - B.x, dy = A.y - B.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 4) {                       // 完全重合：按 id 哈希给一个固定的小偏移，
+          dx = (graphHash(nodes[i].id + "|x") % 10 - 5) / 10;   // 与数组顺序无关，
+          dy = (graphHash(nodes[j].id + "|y") % 10 - 5) / 10;   // 同一份数据每次重排序都一致
+          d2 = 4;
+        }
+        const d = Math.sqrt(d2);
+        const rep = 5400 / d2;
+        const fx = rep * dx / d, fy = rep * dy / d;
+        if (!A.fixed) { A.vx += fx; A.vy += fy; }
+        if (!B.fixed) { B.vx -= fx; B.vy -= fy; }
+      }
+    }
+    for (const l of links) {
+      const A = pos[l.a], B = pos[l.b];
+      const dx = B.x - A.x, dy = B.y - A.y;
+      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const rest = 96 - l.w * 5;                     // 共同引用越多，拉得越近
+      const f = (d - rest) * 0.012 * (0.4 + l.w / 10);
+      const fx = f * dx / d, fy = f * dy / d;
+      if (!A.fixed) { A.vx += fx; A.vy += fy; }
+      if (!B.fixed) { B.vx -= fx; B.vy -= fy; }
+    }
+    for (let i = 0; i < pos.length; i++) {
+      const P = pos[i];
+      if (P.fixed) continue;
+      P.vy += (yearY(nodes[i]) - P.y) * (mode === "year" ? 0.02 : 0.004);
+      P.vx += (cx - P.x) * 0.0022;
+      P.x += P.vx * 0.5 * cool;
+      P.y += P.vy * 0.5 * cool;
+      P.vx *= 0.7; P.vy *= 0.7;
+      P.x = Math.max(30, Math.min(W - 30, P.x));
+      P.y = Math.max(26, Math.min(H - 26, P.y));
+    }
+  }
+  return {pos: pos, W: W, H: H};
+}
+
+// 别叫 graphPanelHTML：本页已有一个画耗时瀑布图的同名函数（在后文），
+// 函数声明会提升，重名会把它覆盖掉，图谱面板就永远打不开。
+function citeGraphPanelHTML() {
+  // 同一张面板服务两种图：单篇（seed）和整轮（pool）。pool 模式下输入框仍然
+  // 可用，用来从整轮跳到某一篇的单篇网络，不用先返回结果再找卡片。
+  const pool = GRAPH.kind === "pool";
+  return '<div class="panel" id="gpanel">' +
+    '<div class="bar gctl">' +
+    '<button type="button" class="ghost mini" id="gback">← 返回结果</button>' +
+    '<input id="gseed" type="text" style="flex:1 1 340px;min-width:200px" ' +
+    'placeholder="' + (pool ? "换看单篇：DOI / OpenAlex ID / 论文标题 / 主题词"
+                             : "换一篇：DOI / OpenAlex ID / 论文标题，或一个研究主题") + '" value="' +
+    attr(GRAPH.seed || "") + '">' +
+    '<button type="button" class="ghost mini" id="grebuild">🕸 ' +
+      (pool ? "看这一篇" : "生成图谱") + "</button>" +
+    "</div>" +
+    '<h2 style="margin:8px 0 2px" id="gtitle">🕸 ' +
+      (pool ? "本轮论文关系图谱" : "文献关系图谱") + "</h2>" +
+    '<div class="meta" id="gstatus"></div><div id="gbody"></div></div>';
+}
+
+function setGraphStatus(html) {
+  const el = $("gstatus");
+  if (el) el.innerHTML = html;
+}
+
+function openGraphPanel() {
+  setEmptyVisible(false);
+  chips.innerHTML = ""; toolbar.innerHTML = ""; logBox.style.display = "none";
+  GRAPH.data = null; GRAPH.pos = null; GRAPH.sel = null;
+  GRAPH.view = {k: 1, x: 0, y: 0};
+  GRAPH.info = {};   // 换一张图就重来：节点变了，按节点缓存的详情也没用了
+  answerBox.innerHTML = citeGraphPanelHTML();
+  wireGraphPanel();
+}
+
+function showGraphPanel(seed) {
+  GRAPH.kind = "seed";
+  GRAPH.seed = seed || GRAPH.seed || "";
+  openGraphPanel();
+  if (GRAPH.seed) loadGraph(GRAPH.seed);   // 点卡片进来直接开抓，不必再点一次
+  else setGraphStatus("输入一篇论文或一个主题，画出它的引用网络");
+}
+
+// 整轮图谱：把这一轮检索到的全部论文放进同一张图，看它们之间以及和共同奠基
+// 文献的关系。种子不是一个 DOI 而是一批论文，所以走另一个端点。
+function showPoolGraph() {
+  const papers = (current && current.papers) || [];
+  if (!papers.length) { flashMsg("先跑一次检索，才有本轮的论文可以成图"); return; }
+  GRAPH.kind = "pool";
+  GRAPH.seed = "";
+  openGraphPanel();
+  loadPoolGraph(papers);
+}
+
+function wireGraphPanel() {
+  const back = $("gback");
+  if (back) back.addEventListener("click", graphBack);
+  const seedInput = $("gseed");
+  if (seedInput) {
+    seedInput.addEventListener("keydown", ev => {
+      if (ev.key === "Enter") { ev.preventDefault(); graphRebuild(); }
+    });
+  }
+  const rebuild = $("grebuild");
+  if (rebuild) rebuild.addEventListener("click", graphRebuild);
+  if (GRAPH.wired) return;          // window-level drag handles are installed once
+  GRAPH.wired = true;
+  window.addEventListener("mousemove", graphDragMove);
+  window.addEventListener("mouseup", graphDragEnd);
+}
+
+function graphRebuild() {
+  const v = String(($("gseed") || {}).value || "").trim();
+  if (!v) { setGraphStatus('<span class="cerr">先填一个 DOI、标题或主题</span>'); return; }
+  GRAPH.seed = v;
+  loadGraph(v);
+}
+
+async function loadGraph(seed) {
+  GRAPH.busy = true;
+  setGraphStatus("⏳ 正在抓取引用网络（OpenAlex：参考文献 + 引用它的文献 + 共同引用相似度）…");
+  try {
+    await fetchGraph("/citegraph", {seed: seed}, "seed");
+  } catch (e) {
+    setGraphStatus('<span class="cerr">' + esc(e && e.message ? e.message : e) + "</span>");
+  } finally {
+    GRAPH.busy = false;
+  }
+}
+
+// 整轮图谱的取数：把这一轮的论文交给 /poolgraph。种子是一批论文而不是一篇，
+// 所以是另一个端点、另一套说法（共同奠基），但渲染与交互完全复用。
+async function loadPoolGraph(papers) {
+  GRAPH.busy = true;
+  setGraphStatus("⏳ 正在拼本轮的引用网络（Semantic Scholar 参考文献 + OpenAlex 元数据，"
+    + "整批一次问完，约 5-15 秒）…");
+  const slim = papers.slice(0, 60).map(p => ({      // 只送服务器真正要用的字段
+    doi: p.doi || "", title: p.title || "", year: p.year, citations: p.citations,
+    arxiv_id: p.arxiv_id || "", venue: p.venue || "",
+    authors: (p.authors || []).slice(0, 2),
+  }));
+  try {
+    await fetchGraph("/poolgraph", {papers: slim}, "pool");
+  } catch (e) {
+    setGraphStatus('<span class="cerr">' + esc(e && e.message ? e.message : e) + "</span>");
+  } finally {
+    GRAPH.busy = false;
+  }
+}
+
+// 两种图谱共用的取数与落地：拿到 payload 后布局、画壳。
+async function fetchGraph(url, payload, kind) {
+  const body = $("gbody");
+  if (body) body.innerHTML = "";
+  const resp = await fetch(url, {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)});
+  const j = await resp.json().catch(() => ({}));
+  if (!resp.ok || !j.graph) throw new Error(j.error || "图谱构建失败");
+  GRAPH.data = j.graph;
+  GRAPH.kind = j.graph.kind || kind;
+  // 面板是两种图共用的，取数回来后把标题/按钮/提示切到当前这一种
+  const title = $("gtitle");
+  if (title) title.textContent = GRAPH.kind === "pool" ? "🕸 本轮论文关系图谱" : "🕸 文献关系图谱";
+  const rb = $("grebuild");
+  if (rb) rb.textContent = GRAPH.kind === "pool" ? "🕸 看这一篇" : "🕸 生成图谱";
+  const si = $("gseed");
+  if (si) si.placeholder = GRAPH.kind === "pool"
+    ? "换看单篇：DOI / OpenAlex ID / 论文标题 / 主题词"
+    : "换一篇：DOI / OpenAlex ID / 论文标题，或一个研究主题";
+  GRAPH.sel = null;
+  GRAPH.view = {k: 1, x: 0, y: 0};
+  GRAPH.info = {};
+  GRAPH.pos = graphLayout(GRAPH.data, GRAPH.mode);
+  renderGraphShell();
+}
+
+function renderGraphShell() {
+  const g = GRAPH.data;
+  if (!g) return;
+  const s = g.stats || {}, seed = g.seed || {}, yr = g.year_range || [];
+  let head;
+  if (g.kind === "pool") {
+    head = "本轮 " + s.pool + " 篇论文" +
+      (s.foundation ? " + 它们共同引用的 " + s.foundation + " 篇奠基文献" : "") +
+      "｜" + s.nodes + " 节点 / " + s.edges + " 条关系" +
+      (s.coupled_edges ? "（相似 " + s.coupled_edges : "") +
+      (s.citing_edges ? " · 互引 " + s.citing_edges : "") +
+      (s.coupled_edges ? "）" : "") +
+      "｜" + (s.seconds || 0) + "s";
+    if (s.refs_coverage !== undefined) {
+      head += "｜参考文献取自 " + s.refs_coverage + "/" + s.pool + " 篇";
+    }
+  } else {
+    head = "以《" + esc((seed.title || "").slice(0, 70)) + "》为中心（" + (seed.year || "?") +
+      "，被引 " + (seed.citations || 0) + "）｜" + s.nodes + " 篇文献 / " + s.edges + " 条关系" +
+      "｜先行 " + s.prior + " · 后续 " + s.derivative +
+      (s.coupled_edges ? " · 相似边 " + s.coupled_edges : "") + "｜" + (s.seconds || 0) + "s";
+    if (s.off_field) head += "｜已滤掉 " + s.off_field + " 篇跨领域引用";
+  }
+  (s.warnings || []).forEach(w => { head += '<br><span class="cerr">⚠️ ' + esc(w) + "</span>"; });
+  setGraphStatus(head);
+  $("gbody").innerHTML =
+    '<div class="bar gctl">' +
+    '<span class="slab">🔄 重排：</span>' +
+    '<button type="button" class="ghost mini" id="gmode-year">按年份（看脉络）</button>' +
+    '<button type="button" class="ghost mini" id="gmode-sim">按相似度（看聚类）</button>' +
+    '<span class="slab" style="margin-left:auto">⬇ 导出：</span>' +
+    '<button type="button" class="ghost mini" id="gsvg-btn">SVG 图</button>' +
+    '<button type="button" class="ghost mini" id="gcsv-btn">CSV（节点+边）</button>' +
+    "</div>" +
+    '<div class="gwrap"><div class="gmap" id="gmap"></div>' +
+    '<div class="gside" id="gside"></div></div>';
+  $("gmode-year").addEventListener("click", () => { GRAPH.mode = "year"; relayoutGraph(); });
+  $("gmode-sim").addEventListener("click", () => { GRAPH.mode = "sim"; relayoutGraph(); });
+  $("gsvg-btn").addEventListener("click", downloadGraphSVG);
+  $("gcsv-btn").addEventListener("click", downloadGraphCSV);
+  wireGraphMap();
+  renderGraph();
+  renderGraphSide();
+}
+
+function relayoutGraph() {
+  if (!GRAPH.data) return;
+  GRAPH.pos = graphLayout(GRAPH.data, GRAPH.mode);
+  renderGraph();
+}
+
+function wireGraphMap() {
+  const map = $("gmap");
+  if (!map) return;
+  map.addEventListener("wheel", ev => {
+    if (!GRAPH.data) return;
+    ev.preventDefault();
+    const svg = $("gsvg");
+    if (!svg) return;
+    const p = svgUserPoint(svg, ev);
+    const k2 = Math.max(0.35, Math.min(6, GRAPH.view.k * (ev.deltaY < 0 ? 1.13 : 0.885)));
+    GRAPH.view.x = p.x - (p.x - GRAPH.view.x) * (k2 / GRAPH.view.k);
+    GRAPH.view.y = p.y - (p.y - GRAPH.view.y) * (k2 / GRAPH.view.k);
+    GRAPH.view.k = k2;
+    applyGraphView();
+  }, {passive: false});
+  map.addEventListener("mousedown", ev => {
+    if (!GRAPH.data) return;
+    const el = ev.target.closest ? ev.target.closest(".gnode") : null;
+    if (el) {
+      GRAPH.drag = {mode: "node", i: +el.dataset.i, moved: false};
+      selectGraphNode(el.dataset.gid);
+    } else {
+      GRAPH.drag = {mode: "pan", x: ev.clientX, y: ev.clientY,
+                    vx: GRAPH.view.x, vy: GRAPH.view.y, moved: false};
+    }
+    ev.preventDefault();
+  });
+  map.addEventListener("dblclick", ev => {
+    const el = ev.target.closest ? ev.target.closest(".gnode") : null;
+    if (el) graphRecentre(el.dataset.gid);
+  });
+}
+
+function graphDragMove(ev) {
+  const d = GRAPH.drag;
+  if (!d || !GRAPH.pos) return;
+  d.moved = true;
+  if (d.mode === "pan") {
+    GRAPH.view.x = d.vx + (ev.clientX - d.x);
+    GRAPH.view.y = d.vy + (ev.clientY - d.y);
+    applyGraphView();
+    return;
+  }
+  const svg = $("gsvg");
+  if (!svg) return;
+  const p = svgUserPoint(svg, ev);
+  const P = GRAPH.pos.pos[d.i];
+  if (!P) return;
+  P.x = Math.max(20, Math.min(GRAPH.pos.W - 20, p.x));
+  P.y = Math.max(20, Math.min(GRAPH.pos.H - 20, p.y));
+  P.fixed = true;
+  if (!GRAPH._raf) {
+    GRAPH._raf = requestAnimationFrame(() => { GRAPH._raf = null; renderGraph(); });
+  }
+}
+
+function graphDragEnd() {
+  if (GRAPH.drag && GRAPH.drag.mode === "node") {
+    const P = GRAPH.pos && GRAPH.pos.pos[GRAPH.drag.i];
+    if (P && !GRAPH.drag.moved) P.fixed = false;   // a click, not a drag: let it float
+    else if (P) setTimeout(() => { P.fixed = false; relayoutGraph(); }, 400);
+  }
+  GRAPH.drag = null;
+}
+
+function svgUserPoint(svg, ev) {
+  const r = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal;
+  return {x: (ev.clientX - r.left) / r.width * vb.width,
+          y: (ev.clientY - r.top) / r.height * vb.height};
+}
+
+function applyGraphView() {
+  const z = $("gzoom");
+  if (!z) return;
+  const v = GRAPH.view;
+  z.setAttribute("transform",
+    "translate(" + v.x.toFixed(1) + "," + v.y.toFixed(1) + ") scale(" + v.k.toFixed(3) + ")");
+}
+
+function renderGraph() {
+  const g = GRAPH.data, lay = GRAPH.pos;
+  const map = $("gmap");
+  if (!g || !lay || !map) return;
+  const pos = lay.pos, W = lay.W, H = lay.H;
+  const idx = {};
+  g.nodes.forEach((n, i) => { idx[n.id] = i; });
+  const yr = (g.year_range && g.year_range.length === 2) ? g.year_range : [2020, 2020];
+  const span = Math.max(1, yr[1] - yr[0]);
+  const maxCite = Math.max(1, g.nodes.reduce((m, n) => Math.max(m, n.citations || 0), 0));
+  const radius = n => 5 + 17 * Math.sqrt(Math.min(1, (n.citations || 0) / maxCite));
+  const labelled = {};
+  if (g.kind === "pool") {
+    // 整轮图的主角是本轮论文：它们再小也要有名字，另外标出最承重的奠基文献
+    g.nodes.filter(n => n.role === "pool")
+      .sort((a, b) => (b.core || 0) - (a.core || 0)).slice(0, 12)
+      .forEach(n => { labelled[n.id] = true; });
+    g.core.slice(0, 10).forEach(n => { labelled[n.id] = true; });
+  } else {
+    g.core.slice(0, 14).forEach(n => { labelled[n.id] = true; });
+  }
+  let s = '<svg id="gsvg" viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg">' +
+    '<g id="gzoom" transform="translate(0,0) scale(1)">';
+  const line = (a, b, attrs) => '<line x1="' + a.x.toFixed(1) + '" y1="' + a.y.toFixed(1) +
+    '" x2="' + b.x.toFixed(1) + '" y2="' + b.y.toFixed(1) + '" ' + attrs + "/>";
+  for (const e of g.edges) {
+    const a = idx[e.source], b = idx[e.target];
+    if (a == null || b == null) continue;
+    if (e.kind === "coupled") {
+      const w = Math.min(e.weight || 1, 10);
+      s += line(pos[a], pos[b], 'stroke="#8aa0c8" stroke-opacity="' +
+        (0.12 + 0.045 * w).toFixed(2) + '" stroke-width="' + (0.6 + w * 0.3).toFixed(2) + '"');
+    } else {
+      s += line(pos[a], pos[b],
+        'stroke="#c8a24a" stroke-opacity="0.30" stroke-width="1" stroke-dasharray="3 3"');
+    }
+  }
+  const nb = graphNeighbours();
+  g.nodes.forEach((n, i) => {
+    const p = pos[i], r = radius(n);
+    const isSeed = n.role === "seed";
+    const on = GRAPH.sel === null || n.id === GRAPH.sel || nb[n.id];
+    const core = n.core || 0;
+    const ring = core >= 0.75 ? 2.6 : (core >= 0.4 ? 1.5 : 0.8);
+    s += '<g class="gnode' + (GRAPH.sel === n.id ? " sel" : "") + '" data-gid="' + attr(n.id) +
+      '" data-i="' + i + '" opacity="' + (on ? 1 : 0.25) + '">' +
+      '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="' + r.toFixed(1) +
+      '" fill="' + yearColor((n.year ? n.year - yr[0] : 0) / span) + '" fill-opacity="0.92" stroke="' +
+      (isSeed ? "#111" : (core >= 0.4 ? "#f5b301" : "rgba(0,0,0,.28)")) + '" stroke-width="' +
+      (isSeed ? 2.6 : ring).toFixed(1) + '"/>' +
+      '<title>' + esc((n.title || "") + "\\n" + (n.year || "?") + " · 被引 " + (n.citations || 0) +
+        (n.venue ? "\\n" + n.venue : "") + "\\n核心度 " + core.toFixed(2) + " · 与种子相似度 " +
+        (n.sim || 0).toFixed(2)) + "</title></g>";
+    if (isSeed || labelled[n.id]) {
+      s += '<text x="' + (p.x + r + 3).toFixed(1) + '" y="' + (p.y + 3).toFixed(1) +
+        '" class="glab">' + esc((n.title || "").slice(0, 30)) + "</text>";
+    }
+  });
+  s += "</g></svg>";
+  map.innerHTML = s;
+  applyGraphView();
+}
+
+function graphNeighbours() {
+  const out = {};
+  if (!GRAPH.data || !GRAPH.sel) return out;
+  for (const e of GRAPH.data.edges) {
+    if (e.source === GRAPH.sel) out[e.target] = 1;
+    if (e.target === GRAPH.sel) out[e.source] = 1;
+  }
+  return out;
+}
+
+function graphNode(id) {
+  return (GRAPH.data && GRAPH.data.nodes || []).filter(n => n.id === id)[0] || null;
+}
+
+// 点开一个圆圈，要看到「这篇文献本身」：本轮工作集里就有它（含摘要、PDF 链接）
+// 就直接用；没有就问一次 /paperinfo 要它的完整记录。结果按节点缓存，同一张图里
+// 再点一次不再发请求。节点带的是 OpenAlex 记录，工作集是检索结果，两者用 DOI
+// （没有 DOI 时用标题）对齐。
+function roundPaperOf(node) {
+  const papers = (current && current.papers) || [];
+  if (!node || !papers.length) return null;
+  const norm = t => String(t || "").toLowerCase().replace(/\\s+/g, " ").trim();
+  const doi = norm(node.doi), title = norm(node.title);
+  for (let i = 0; i < papers.length; i++) {
+    const p = papers[i];
+    if (doi && norm(p.doi) === doi) return {paper: p, idx: i};
+    if (!doi && title && norm(p.title) === title) return {paper: p, idx: i};
+  }
+  return null;
+}
+
+function graphEnsureInfo(id) {
+  const node = graphNode(id);
+  if (!node || GRAPH.info[id] !== undefined) return;
+  if (roundPaperOf(node)) { GRAPH.info[id] = {state: "local"}; return; }
+  GRAPH.info[id] = {state: "loading"};
+  renderGraphSide();                      // 先把「正在取」摆出来，别让点下去没反应
+  fetch("/paperinfo", {method: "POST", headers: {"Content-Type": "application/json"},
+                       body: JSON.stringify({key: node.doi || node.id || node.title})})
+    .then(r => r.json().catch(() => ({})).then(j => ({ok: r.ok, j: j})))
+    .then(res => {
+      GRAPH.info[id] = (res.ok && res.j && res.j.paper)
+        ? {state: "paper", paper: res.j.paper}
+        : {state: "none", error: (res.j && res.j.error) || "取不到这篇的完整记录"};
+    })
+    .catch(e => {
+      GRAPH.info[id] = {state: "none", error: "取不到这篇的完整记录：" + (e && e.message ? e.message : e)};
+    })
+    .then(() => { if (GRAPH.sel === id) renderGraphSide(); });
+}
+
+function graphRoleLabel(role) {
+  const pool = GRAPH.kind === "pool";
+  if (pool) return role === "prior" ? "🔵 共同奠基（本批论文一起引用的）" : "🟣 本轮论文";
+  return role === "seed" ? "🟣 起点"
+       : (role === "prior" ? "🔵 先行文献（它引用的）" : "🟠 后续文献（引用它的）");
+}
+
+// 选中节点的详情卡：标题、作者、出处、被引、核心度、摘要，以及「打开原文 /
+// 看它在结果里的卡片 / 以它为中心重建图谱」
+function graphDetailHTML(n) {
+  const pool = GRAPH.kind === "pool";
+  const local = roundPaperOf(n);
+  const rec = GRAPH.info[n.id] || {};
+  const paper = (local ? local.paper : (rec.state === "paper" ? rec.paper : null)) || {};
+  const authors = (paper.authors || []).length ? paper.authors : (n.authors || []);
+  const year = paper.year || n.year, cites = (paper.citations != null ? paper.citations : n.citations);
+  const venue = paper.venue || n.venue || "", abstract = paper.abstract || "";
+  let s = '<div class="gdetail" id="gdetail"><strong>' + esc(paper.title || n.title || "") + "</strong>" +
+    '<div class="meta">' + graphRoleLabel(n.role) + " · " + (year || "?") + " · 被引 " + (cites || 0) +
+    " · 核心度 " + (n.core || 0).toFixed(2) +
+    // "与种子相似度" 只在单篇图里有意义；整轮图的相似度是同批最像的一篇
+    (typeof n.sim === "number"
+      ? " · " + (pool ? "与本批最像的一篇 " : "与种子相似度 ") + n.sim.toFixed(2) : "") +
+    (n.support !== undefined && pool ? " · 本批有 " + n.support + " 篇引用它" : "") +
+    (venue ? "<br>" + esc(venue) : "") +
+    (authors.length ? "<br>作者：" + esc(authors.slice(0, 10).join("; ")) +
+      (authors.length > 10 ? " 等 " + authors.length + " 人" : "") : "") + "</div>";
+  if (rec.state === "loading") {
+    s += '<div class="meta">⏳ 正在取这篇的摘要与出处…</div>';
+  } else if (abstract) {
+    s += '<div class="meta abs" title="点击展开 / 收起摘要">' + esc(abstract) + "</div>";
+  } else if (rec.state === "none") {
+    s += '<div class="meta">' + esc(rec.error || "") + "</div>";
+  }
+  const links = [];
+  if (local) {
+    // 就在本轮工作集里：给和结果卡片一模一样的那排链接（DOI/arXiv/PDF/来源页/BibTeX/复制引用）
+    links.push(paperLinks(local.paper, local.idx));
+  } else {
+    if (paper.doi || n.doi) links.push('<a href="https://doi.org/' +
+      encodeURIComponent(paper.doi || n.doi) + '" target="_blank">DOI</a>');
+    if (paper.pdf_url) links.push('<a href="' + esc(paper.pdf_url) + '" target="_blank">PDF</a>');
+    if (paper.openalex_url) links.push('<a href="' + esc(paper.openalex_url) + '" target="_blank">OpenAlex</a>');
+  }
+  if (local && current && current.mode !== "explore") {
+    links.push('<button type="button" class="ghost mini" id="gcard">📄 看它在结果里的卡片</button>');
+  }
+  if (n.role !== "seed") {
+    links.push('<button type="button" class="ghost mini" id="gcenter">🎯 以它为中心重建图谱</button>');
+  }
+  return s + '<div class="links">' + links.join("") + "</div></div>";
+}
+
+function graphListHTML(title, items, note) {
+  if (!items.length) return "";
+  return '<h4 style="margin:12px 0 2px">' + title +
+    '</h4><div class="meta" style="margin-bottom:4px">' + note + '</div><ul class="glist">' +
+    items.map(n => '<li data-gid="' + attr(n.id) + '"' + (GRAPH.sel === n.id ? ' class="sel"' : "") +
+      ">" + esc((n.title || "").slice(0, 62)) + '<div class="gm">' + (n.year || "?") + " · 被引 " +
+      (n.citations || 0) + " · 核心度 " + (n.core || 0).toFixed(2) + "</div></li>").join("") +
+    "</ul>";
+}
+
+function renderGraphSide() {
+  const g = GRAPH.data, side = $("gside");
+  if (!g || !side) return;
+  const pool = g.kind === "pool";
+  const yr = (g.year_range && g.year_range.length === 2) ? g.year_range : [2020, 2020];
+  const roles = {prior: [], derivative: [], pool: []};
+  g.nodes.forEach(n => { if (roles[n.role]) roles[n.role].push(n); });
+  const byCore = list => list.slice().sort((a, b) => (b.core || 0) - (a.core || 0));
+  const sel = GRAPH.sel ? graphNode(GRAPH.sel) : null;
+  let s = sel ? graphDetailHTML(sel) : "";
+  s += '<div class="glegend">' +
+    '<div class="gyear"></div>' +
+    '<div class="meta">' + yr[0] + " ← 发表年份 → " + yr[1] + "（蓝＝早，红＝新）</div>" +
+    '<div class="meta">圆圈越大被引越多；金圈 = 核心度高；虚线 = 引用关系（黄）' +
+    "；实线 = 共同引用（越粗越像）</div>" +
+    '<div class="meta">点圆圈看这篇文献的摘要与出处（就在本栏上方）；双击以它为中心重画</div>' +
+    (pool ? '<div class="meta">右侧是本轮论文，左侧是它们共同引用的奠基文献；' +
+            "没有连线的论文 = 数据里与本批查不到共同引用（多半是这次检索跑题的结果）</div>" : "") +
+    "</div>";
+  s += graphListHTML("⭐ 核心文献", byCore(g.core || []).slice(0, 12),
+                     pool ? "本批里最承重的节点：论文按连着几篇同批论文算，奠基文献按被几篇同批论文引用算，"
+                            + "都在各自组内归一化，不是按被引量"
+                          : "按图内共被引/领域奠基强度排序，不是按被引量");
+  if (pool) {
+    s += graphListHTML("🟣 本轮论文", byCore(roles.pool).slice(0, 30), "这一轮检索到的，按图内连接度排");
+    s += graphListHTML("🔵 共同奠基（本批论文一起引用的）", byCore(roles.prior).slice(0, 24),
+                       "这一批集体站在谁肩上");
+  } else {
+    s += graphListHTML("🔵 先行文献（它引用的）", byCore(roles.prior).slice(0, 20), "领域站在谁肩上");
+    s += graphListHTML("🟠 后续文献（引用它的）", byCore(roles.derivative).slice(0, 20), "后来的人接着往哪走");
+  }
+  side.innerHTML = s;
+  const center = $("gcenter");
+  if (center && sel) center.addEventListener("click", () => graphRecentre(sel.id));
+  const card = $("gcard");
+  if (card && sel) card.addEventListener("click", () => {
+    const local = roundPaperOf(sel);
+    if (!local) return;
+    graphBack();                          // 回到结果视图，再去那张卡片的位置
+    revealPaper("cite-" + (local.idx + 1));
+  });
+  side.querySelectorAll(".glist li").forEach(li => {
+    li.addEventListener("click", () => {
+      selectGraphNode(li.dataset.gid);
+      centerGraphNode(li.dataset.gid);
+    });
+  });
+}
+
+function selectGraphNode(id) {
+  GRAPH.sel = (GRAPH.sel === id) ? null : id;
+  renderGraph();
+  if (GRAPH.sel) {
+    graphEnsureInfo(id);
+    const side = $("gside");              // 详情卡在侧栏最上面，把人带过去
+    if (side) side.scrollTop = 0;
+  }
+  renderGraphSide();
+}
+
+function centerGraphNode(id) {
+  const g = GRAPH.data, lay = GRAPH.pos;
+  if (!g || !lay) return;
+  const i = g.nodes.findIndex(n => n.id === id);
+  if (i < 0) return;
+  const k = Math.max(GRAPH.view.k, 1.5);
+  GRAPH.view.k = k;
+  GRAPH.view.x = lay.W / 2 - lay.pos[i].x * k;
+  GRAPH.view.y = lay.H / 2 - lay.pos[i].y * k;
+  applyGraphView();
+  renderGraph();
+}
+
+function graphRecentre(id) {
+  const n = graphNode(id);
+  if (!n) return;
+  const seed = n.doi || n.title;
+  if (!seed) return;
+  GRAPH.seed = seed;
+  const input = $("gseed");
+  if (input) input.value = seed;
+  loadGraph(seed);
+}
+
+function downloadGraphSVG() {
+  const svg = $("gsvg");
+  if (!svg) return;
+  const clone = svg.cloneNode(true);
+  const z = clone.querySelector("#gzoom");
+  if (z) z.setAttribute("transform", "translate(0,0) scale(1)");
+  const doc = "<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>\\n" +
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="' + svg.getAttribute("viewBox") + '">' +
+    "<style>text{font:11px sans-serif;fill:#555}.glab{font-size:9px}.gnode title{display:none}</style>" +
+    clone.innerHTML + "</svg>";
+  downloadBlob("scholarmate-graph-" + ((GRAPH.data.seed || {}).id || "seed") + ".svg",
+               new Blob([doc], {type: "image/svg+xml"}));
+}
+
+function downloadGraphCSV() {
+  const g = GRAPH.data;
+  if (!g) return;
+  const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '\\"\\"') + '"';
+  const head = ["kind", "id_or_source", "target", "title", "year", "citations", "role",
+                "core", "sim", "venue", "doi", "weight_edge"];
+  const rows = [head.join(",")];
+  g.nodes.forEach(n => {
+    rows.push(["node", n.id, "", n.title, n.year, n.citations, n.role, n.core, n.sim,
+               n.venue, n.doi, ""].map(q).join(","));
+  });
+  g.edges.forEach(e => {
+    rows.push(["edge", e.source, e.target, "", "", "", e.kind, "", "", "", "", e.weight].map(q).join(","));
+  });
+  download("scholarmate-graph-" + ((g.seed || {}).id || "seed") + ".csv",
+           "\\ufeff" + rows.join("\\n"), "text/csv;charset=utf-8");
+}
+
+function graphBack() {
+  if (current && current.mode !== "explore" && (current.papers || current.answer)) {
+    renderAudits(current);
+  } else {
+    answerBox.innerHTML = "";
+    setEmptyVisible(true);
+  }
 }
 
 const SORT_LABELS = {relevance:"相关性", year_desc:"发表时间 近→远", year_asc:"发表时间 远→近",
@@ -2429,6 +3147,7 @@ function applyExploreStatus(st) {
 
 function showExplorePanel() {
   setEmptyVisible(false);
+  rememberExploreView();   // 切回「领域探索」时看到的是这张面板，而不是上一次的报告
   chips.innerHTML = ""; toolbar.innerHTML = ""; logBox.style.display = "none";
   answerBox.innerHTML = explorePanelHTML();
   renderExplorePanel();
@@ -2559,8 +3278,58 @@ function restoreExplore(data) {
     : "这次会话还没有产出方向。");
 }
 
+// 记住「这个模式刚才展示的是什么」：结果视图（能被 renderAudits 重放）或活的探索面板
+function rememberResultView(data) {
+  const m = !data ? "" : (data.mode === "survey" ? "explore" : data.mode);
+  if (Object.prototype.hasOwnProperty.call(LAST_BY_MODE, m)) {
+    LAST_BY_MODE[m] = {kind: "result", data: data};
+  }
+}
+function rememberExploreView() { LAST_BY_MODE.explore = {kind: "explore"}; }
+
+// 把一份结果放回视图（历史记录加载与模式切换共用）
+function showResult(data) {
+  window.EX = data.exports || {};
+  window.BIBTEX = Object.keys(data.per_paper_bibtex || {}).map(k => data.per_paper_bibtex[k]);
+  window.SNAP = JSON.stringify(data);
+  current = data;
+  if (data.sort) $("sort").value = data.sort;
+  logBox.style.display = "none";
+  chips.innerHTML = ""; toolbar.innerHTML = "";
+  answerBox.innerHTML = "";
+  setEmptyVisible(false);
+  renderAudits(data);
+  refreshScreening(data.id);
+  // 运行日志（#log 自带 260px 滚动上限）也跟着回来：切模式看到的应该和刚才一样
+  if (data.log && data.log.length) { logBox.textContent = data.log; logBox.style.display = "block"; }
+}
+
+// 这个模式还没跑过：清掉上一个模式的结果，免得把它当成这个模式的结果（也避免导出、
+// 追问、图谱这些操作作用在上一个模式的数据上）
+function clearResultView() {
+  current = null;
+  chips.innerHTML = ""; toolbar.innerHTML = "";
+  logBox.style.display = "none";
+  answerBox.innerHTML = "";
+  setEmptyVisible(true);
+}
+
+function runInFlightNow() { return runInFlight || EXPLORE.busy || EXPLORE.job; }
+
+// 模式单选：视图跟着模式走，看到的是该模式自己的结果
+function modeSwitched() {
+  const radio = document.querySelector('input[name="mode"]:checked');
+  const mode = radio ? radio.value : "ask";
+  if (runInFlightNow()) return;   // 运行中不换：结果一出来就渲染在正确的视图里
+  const entry = LAST_BY_MODE[mode];
+  if (!entry) { clearResultView(); return; }
+  if (entry.kind === "explore") { showExplorePanel(); return; }
+  showResult(entry.data);
+}
+
 function renderAudits(data) {
   setEmptyVisible(false);   // results replace the example-question hints
+  rememberResultView(data);
   if (data.mode === "explore") { restoreExplore(data); return; }
   const audits = data.audits || {};
   let html = "";
@@ -2654,6 +3423,7 @@ function renderAudits(data) {
   const ex = data.exports || {};
   if (data.papers.length) {
     toolbar.innerHTML = [
+      '<button class="ghost" id="poolgraphBtn" title="把本轮检索到的全部论文画进同一张图：哪些是同一个故事、哪几篇最承重、这一批集体站在谁肩上。颜色=年份，大小=被引，金圈=图内核心度">🕸 本轮全池图谱（' + data.papers.length + ' 篇）</button>',
       '<span class="slab">📤 导出与台账（' + data.papers.length + ' 篇）</span>',
       '<button class="ghost" onclick="exportCurrent(\\'bibtex\\', \\'scholarmate-' + data.id + '.bib\\', \\'text/x-bibtex\\')">⬇ BibTeX</button>',
       '<button class="ghost" onclick="exportCurrent(\\'ris\\', \\'scholarmate-' + data.id + '.ris\\', \\'application/x-research-info-systems\\')">⬇ RIS</button>',
@@ -2673,6 +3443,8 @@ function renderAudits(data) {
       toolbar.innerHTML += '<button id="rerankBtn" class="ghost">🔁 对当前结果重新打相关性分（不重新检索）</button>';
       wireRerankBtn();
     }
+    const pgb = $("poolgraphBtn");
+    if (pgb) pgb.addEventListener("click", showPoolGraph);
   }
   if (data.answer) {
     const docLabel = data.mode === "ask" ? "回答" : data.mode === "survey" ? "综述报告" : "检索结果";
@@ -2801,25 +3573,21 @@ async function loadHistory(id) {
     const resp = await fetch("/history/" + id);
     const data = await resp.json();
     if (data.error) return;
-    window.EX = data.exports || {}; window.BIBTEX = Object.keys(data.per_paper_bibtex || {}).map(k => data.per_paper_bibtex[k]);
-    window.SNAP = JSON.stringify(data);
-    current = data;
-    $("sort").value = data.sort || "relevance";
-    logBox.style.display = "none";
     if (data.mode === "explore") {
       // an exploration session has no papers or answer: rebuilding it means
       // replaying the directions it produced, not a result view
+      window.EX = data.exports || {};
+      window.BIBTEX = Object.keys(data.per_paper_bibtex || {}).map(k => data.per_paper_bibtex[k]);
+      window.SNAP = JSON.stringify(data);
+      current = data;
+      $("sort").value = data.sort || "relevance";
+      logBox.style.display = "none";
       chips.innerHTML = "";
       toolbar.innerHTML = "";
       renderAudits(data);
-      toolbar.scrollIntoView({behavior: "smooth", block: "start"});
-      return;
+    } else {
+      showResult(data);
     }
-    answerBox.innerHTML = "";
-    chips.innerHTML = "";
-    setEmptyVisible(false);
-    renderAudits(data);
-    refreshScreening(data.id);
     toolbar.scrollIntoView({behavior: "smooth", block: "start"});
   } catch (e) { console.error(e); }
 }
@@ -3235,6 +4003,114 @@ class Handler(BaseHTTPRequestHandler):
         self._send(202, "application/json",
                    json.dumps({"id": job["id"], "status": "queued"}).encode("utf-8"))
 
+    def _citegraph(self, payload):
+        """One paper -> its citation neighbourhood (see citationgraph.py).
+
+        Built synchronously rather than through the job queue: it is a handful
+        of OpenAlex requests (measured 3-10s) and the reader is staring at
+        exactly this one thing, so handing back a job id to poll would only add
+        latency. The request writes nothing, so it needs no owner: the answer is
+        the same public data for everybody.
+        """
+        seed = str((payload or {}).get("seed") or "").strip()[:400]
+        if not seed:
+            self._send(400, "application/json", json.dumps(
+                {"error": "请输入 DOI、OpenAlex ID、论文标题，或一个研究主题"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+        try:
+            built = citationgraph.build(seed)
+        except LookupError as e:
+            self._send(404, "application/json",
+                       json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+            return
+        except citationgraph.GraphError as e:
+            # the network, not the input: 503 so the reader knows to retry
+            self._send(503, "application/json",
+                       json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+            return
+        except Exception as e:
+            self._send(502, "application/json", json.dumps(
+                {"error": f"图谱构建失败：{type(e).__name__}: {e}"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+        print("      " + citationgraph.summary(built))
+        self._send(200, "application/json", json.dumps(
+            {"ok": True, "graph": built}, ensure_ascii=False).encode("utf-8"))
+
+    def _poolgraph(self, payload):
+        """A whole round of results -> one graph of how they relate.
+
+        The counterpart of /citegraph: instead of "put this one paper back into
+        its network", this answers "of the twenty papers I just got, which are
+        the same story and what do they all stand on". The browser sends the
+        round's papers (DOI + the fields it already has); the server never reads
+        the store, so this works for a pool that was re-sorted locally, and for
+        a run the reader is merely looking at.
+
+        Synchronous for the same reason /citegraph is: a handful of batched
+        requests (measured 5-20s for 20-40 papers) and the reader is waiting on
+        exactly this.
+        """
+        papers = (payload or {}).get("papers")
+        if not isinstance(papers, list) or not papers:
+            self._send(400, "application/json", json.dumps(
+                {"error": "这一轮没有论文可画"}, ensure_ascii=False).encode("utf-8"))
+            return
+        try:
+            built = citationgraph.build_pool(papers[:120])
+        except LookupError as e:
+            self._send(404, "application/json",
+                       json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+            return
+        except citationgraph.GraphError as e:
+            self._send(503, "application/json",
+                       json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+            return
+        except Exception as e:
+            self._send(502, "application/json", json.dumps(
+                {"error": f"图谱构建失败：{type(e).__name__}: {e}"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+        print("      " + citationgraph.summary(built))
+        self._send(200, "application/json", json.dumps(
+            {"ok": True, "graph": built}, ensure_ascii=False).encode("utf-8"))
+
+    def _paperinfo(self, payload):
+        """One circle in the graph -> the paper behind it.
+
+        The graph payload carries no abstracts (forty of them would triple it
+        for a view that only needs circles), so clicking one asks for that one
+        record. Keys are the same three the graph accepts as a seed -- OpenAlex
+        id, DOI, title -- so "what is this circle" and "rebuild from this
+        circle" can never disagree about which paper they mean. Not queued, for
+        the same reason /citegraph is not: it is one request and the reader is
+        waiting on it.
+        """
+        key = str((payload or {}).get("key") or "").strip()
+        if not key:
+            self._send(400, "application/json", json.dumps(
+                {"error": "缺少要点开的文献"}, ensure_ascii=False).encode("utf-8"))
+            return
+        try:
+            paper = citationgraph.paper_info(key)
+        except citationgraph.GraphError as e:
+            self._send(503, "application/json",
+                       json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+            return
+        except Exception as e:
+            self._send(502, "application/json", json.dumps(
+                {"error": f"查询失败：{type(e).__name__}: {e}"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+        if not paper:
+            self._send(404, "application/json", json.dumps(
+                {"error": "OpenAlex 里没有这篇文献的完整记录（可能已下架或只有预印本）"},
+                ensure_ascii=False).encode("utf-8"))
+            return
+        self._send(200, "application/json", json.dumps(
+            {"ok": True, "paper": paper}, ensure_ascii=False).encode("utf-8"))
+
     def _explore(self, payload):
         """The field-exploration endpoint.
 
@@ -3596,6 +4472,15 @@ def main():
 
         def do_POST(self):
             payload = self._read_json() if self.path != "/ask" else {}
+            if self.path == "/citegraph":
+                self._citegraph(payload)
+                return
+            if self.path == "/poolgraph":
+                self._poolgraph(payload)
+                return
+            if self.path == "/paperinfo":
+                self._paperinfo(payload)
+                return
             if self.path == "/screening":
                 self._screening(payload)
                 return

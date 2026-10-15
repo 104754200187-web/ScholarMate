@@ -2,7 +2,7 @@
 
 一款 OpenScholar 风格的文献智能体：输入研究问题 → 多源检索论文 → LLM 生成带引用的回答 → 三层证据校验（规则 + DeepSeek 归因 + 逐句全文证据）→ 不足则迭代检索。编排层基于 **LangGraph**，检索/校验原语全部为纯 Python 标准库。
 
-支持 **🤖 智能问答**、**📄 仅搜索论文** 与 **🔭 领域探索** 三种模式：读完回答还能**继续追问**（交互对话，不重新检索），以及排序、过滤、**筛选留痕（纳入/排除/待定 + 理由）**、文献导出、批量下载 PDF、运行快照与历史记录。
+支持 **🤖 智能问答**、**📄 仅搜索论文** 与 **🔭 领域探索** 三种模式：读完回答还能**继续追问**（交互对话，不重新检索），以及排序、过滤、**筛选留痕（纳入/排除/待定 + 理由）**、**🕸 文献关系图谱**（把任意论文放回引用网络，或把整轮结果一次画成一张图）、文献导出、批量下载 PDF、运行快照与历史记录。
 
 ## 功能一览
 
@@ -38,6 +38,11 @@
 | | 批量下载 PDF | 智能问答的工作论文集一键打包 **ZIP**：并行抓取可公开获取的 PDF（原始链接 → OpenAlex 开放获取副本 → 落地页 `citation_pdf_url` → arXiv 预印本），并放入文献清单 CSV/BibTeX 与**逐篇下载报告**；付费墙文献列出 DOI/来源页而不是悄悄丢掉 | `pdfpack.py` |
 | 探索 | 领域探索 | 输入一个领域而不是一个问题：先拆成 3-6 个可分别调研的方向，每个方向附 3 篇高被引代表作供你判断；可逐层「深入这一支」，直到你要一份综述报告 | `explore.py` / `graph.py` |
 | | 综述报告 | 勾选若干方向（或全部）→ 一次完整检索 → 按方向分节的 Markdown 报告，含摘要、争议与空白、参考文献；与智能问答共用三层引用校验、证据评分、导出与追问 | `graph.py` / `llm.py` |
+| 图谱 | 🕸 文献关系图谱 | connected-papers 式的引用网络：任意论文卡片上的「🕸 关系图谱」把这篇论文放回它周围的引用网络，左边画布 + 右边榜单。**圆圈颜色＝发表年份**（蓝＝早 → 红＝新）、**圆圈大小＝被引量**、**金圈＝核心度高**（越粗越高）、**虚线＝引用关系**（它引用的先行文献在左、引用它的后续文献在右）、**实线＝共同引用**（越粗＝两篇越像）。拖动、滚轮缩放、双击以某篇为中心重画、鼠标拖动节点都可「固定/放开」（拖动后自动回弹重排），点节点或右侧榜单选中可只看它的邻居 | `citationgraph.py` / `web.py` |
+| | 图谱起点与核心度 | 起点支持 **DOI / OpenAlex ID / 论文标题 / 研究主题词**（主题词走 S2 反查 DOI 兜底）。核心度**不是被引量**：先行文献按「种子的引用者里有多少篇也引用它」（图内共被引强度），后续文献按「引用了多少篇本领域奠基工作」，各类内归一化到 0-1。跨领域的后续文献（领域奠基命中 < 1）会被剔除，剩不到 5 篇时自动放宽并提示，避免以通用工具为种子时把 AlphaFold 这类无关高被引论文顶上来 | `citationgraph.py` |
+| | 图谱导出 | **SVG 图**（可放进论文/PPT，导出时自动复位缩放与隐藏悬浮提示）与 **CSV（节点表 + 边表）**，CSV 带 UTF-8 BOM，Excel 直开 | `web.py` |
+| | 点圆圈看这篇文献 | 点图上任意一个圆圈，右侧就给出**这篇文献本身**：标题、作者、刊物、年份、被引、核心度，加上摘要与出处链接，还有「🎯 以它为中心重建图谱」。本轮工作集里已有的论文（🟣 本轮论文）直接用工作集里的完整卡片数据——摘要、arXiv / PDF / 来源页、BibTeX、复制引用，**不额外发请求**；其余节点（🔵 奠基 / 先行 / 后续）按需向 `POST /paperinfo` 取一次完整记录（实测约 1s），按节点缓存，再点不再请求。若这篇就在本轮工作集里，还多一个「📄 看它在结果里的卡片」直接跳回结果视图并高亮那张卡 | `citationgraph.py` / `web.py` |
+| | 🕸 整轮全池图谱 | 导出工具条第一项的「🕸 本轮全池图谱（N 篇）」把这一轮检索到的论文一次画进同一张图：🟣 本轮论文 + 🔵 被 ≥2 篇共同引用的奠基文献。核心度依旧是**图内位置**——本轮论文＝它在图里连到几篇同批论文（共同引用 ∪ 互相引用），奠基文献＝本批有多少篇引用它，各自类内归一化。整轮图**不抓「谁引用了这 N 篇」**（那是 N 次查询，而这一视图要回答的是这批论文之间的关系） | `citationgraph.py` / `web.py` |
 | 交互 | 追问对话 | 回答下方直接追问（「哪几篇是直接实验证据？」「整理成综述引言」）：优先**只在本轮工作论文集内作答**，引用编号与原回答严格一致 | `chat.py` / `graph.py` |
 | | 追问自补检索 | 这批论文里确实没有时，追问**自己补检**并把新论文按顺序追加编号（已有 `[n]` 不变），再用新材料重答——一次提问即可问完一个多轮研究问题，不必反复开新任务；开关可关（关掉就只基于现有论文作答） | `graph.py` / `search.py` |
 | | 对话留痕 | 追问经 LangGraph 的 `chat_answer → chat_verify` 支线执行，回答做规则层引用校验；每轮回答**追加进该次运行的快照**，刷新/重启后仍在 | `graph.py` / `web.py` |
@@ -52,7 +57,7 @@
 | 工程 | 全文检索 | 开放 PDF 下载 → 抽取 → BM25 段落；并发预取、体积/超时护栏、`fulltext_cache/` 跨运行复用 | `fulltext.py` |
 | | 并行化 | 数据源并行、逐句取证与判决并行、全文并发预取 | `search.py` / `sentences.py` |
 | | 离线评测 | 检索 Recall@K 金标准回归 + 快照质量汇总 | `eval.py` |
-| | 接口 | `/ask`、`/chat`、`/status`、`/history`、`/history/<id>`、`/graph`、`/screening`、`/export`、`/pdfpack` | `web.py` |
+| | 接口 | `/ask`、`/chat`、`/status`、`/history`、`/history/<id>`、`/graph`、`/citegraph`、`/poolgraph`、`/paperinfo`、`/screening`、`/export`、`/pdfpack` | `web.py` |
 
 ## 一、整体管线（LangGraph 节点）
 
@@ -297,6 +302,16 @@ python3 -c "import graph; print(graph.get_app().get_graph().draw_mermaid())"
 - **每轮都校验**：回答经 `chat_verify` 做规则层引用校验（`[n]` 是否越界、是否错配、是否引用撤稿论文），气泡下方显示「引用校验：通过 N ｜ 告警 N ｜ 失败 N」，失败项原文列出。实测一轮追问 5.0s、21 项引用校验全通过。
 - **可中断、可连续、可追溯**：一轮正在回答时可点「⏹ 停止」（合作式中断，未完成的一轮不落盘）；对话按轮**追加进该次运行的快照** `outputs/history/<run_id>.json` 的 `chat` 字段，刷新页面或重启服务后追问历史仍在，且原回答与论文列表完全不被覆盖；同一时刻只允许一轮追问（重复提交返回 409）。
 
+**🕸 文献关系图谱（connected-papers 式）**
+- 每张论文卡片下方都有「🕸 关系图谱」：把这篇论文放回它所在引用网络——**它引用了谁**（先行文献，画在左侧）、**谁引用了它**（后续文献，右侧）、以及**和谁最像**（两两共同引用了多少篇同一批文献）。
+- 四种视觉编码各自回答一个问题：**颜色＝年份**（蓝＝早 → 红＝新，一眼看出哪一片是新长出来的）、**圆圈大小＝被引量**、**金圈粗细＝图内核心度**（哪几篇是这个网络的承重墙）、**虚线＝引用关系 / 实线＝共同引用**（越粗越像）。起点是黑圈。
+- **核心度不是被引量**，这是刻意的：先行文献按「种子有多少篇引用者也引用它」（共被引强度）计，后续文献按「它引用了多少篇本领域奠基工作」计，各自在类内归一化到 0-1。这样「大家都引所以引得多」的通用工具不会被误判为核心，「引用了本领域奠基工作」的新论文才会浮出来。
+- **跨领域污染会被过滤**：以通用工具（如 NumPy）为种子时，按被引排序会把 AlphaFold 这类跨领域高被引论文顶上来，所以领域奠基命中数为 0 的后续文献会被剔除并计入 `stats.off_field`（剔完剩不到 5 篇则自动放宽并按被引补足，结果里给出 `warnings`）。
+- **布局在浏览器里算**，不占服务器：「按年份（看脉络）」把纵向交给发表年份、「按相似度（看聚类）」改成由共引用强度决定远近；可滚轮缩放、拖拽平移、鼠标拖住单个节点摆位置（松手自动回弹重排）、双击某篇「以它为中心重建图谱」，右侧榜单同时给出 ⭐ 核心文献 / 🔵 先行 / 🟠 后续三张表，点条目即高亮它在图里的邻居。
+- **导出**：SVG（可直接放进论文 / PPT，导出时自动复位缩放、隐藏悬浮提示）与 CSV（节点表 + 边表，带 UTF-8 BOM）。服务端只有 `POST /citegraph` 一次请求（实测 DOI 起点 3-4s、主题词起点 7-11s），单个起点可用 **DOI / OpenAlex ID / 论文标题 / 研究主题词**。
+- **整轮全池图谱**：导出工具条第一项的「🕸 本轮全池图谱（N 篇）」不输入起点——直接用当前论文池当种子，一次画出本轮全部论文的关系（🟣 本轮论文 / 🔵 被 ≥2 篇共同引用的奠基文献）。关系取自两个互补的参考文献源：Semantic Scholar 一次批处理 POST 拿全轮参考文献表，S2 没收到的论文再用 OpenAlex 的 `referenced_works` 补（OpenAlex id 分块换 DOI 才能求交），节点元数据（年份、被引）统一取 OpenAlex，免得两个源的被引口径混在一张图里。核心度＝**这篇在本图里站得住吗**：本轮论文＝图内连到几篇同批论文，奠基文献＝本批有几篇引用它。整轮图刻意**不取「谁引用了这 N 篇」**（20 篇就是 20 次查询），与本批其它论文查不到共同引用的论文会如实写成孤点并进 `warnings`。`POST /poolgraph`，实测 40 篇 7-8s、20 篇 10-12s。
+- **点圆圈看文献**：图上每个圆圈都可以点——点了就在右侧给出**这篇文献的卡片**：标题、作者、刊物、年份、被引、核心度（整轮图另给「本批有 N 篇引用它」）、摘要，以及 DOI / PDF / OpenAlex 链接。图数据本身不带摘要（四十篇摘要会让 payload 翻好几倍，而画图只需要圆圈），所以摘要按需取：**这篇就在本轮工作集里**（🟣 本轮论文）直接用工作集的数据，连 arXiv / PDF / 来源页 / BibTeX / 复制引用都和结果卡片一模一样，一个请求都不发；其余节点向 `POST /paperinfo` 取一次它自己的完整记录（实测约 1s，按节点缓存，再点不再请求）。取不到完整记录时如实说明（例如「OpenAlex 里没有这篇文献的完整记录」），图上已知的元数据与 DOI 链接照常显示。这篇在本轮工作集里时还有「📄 看它在结果里的卡片」：跳回结果视图、自动展开工作集并高亮那一张；「🎯 以它为中心重建图谱」仍然可用（双击圆圈同效）。
+
 **导出与快照**
 - 批量：BibTeX / RIS / GB/T 7714 / CSL-JSON；单篇：BibTeX；论文清单 CSV（含摘要，可按筛选子集）。
 - 文档：回答（智能问答）或检索结果（仅搜索论文）可导出 **Markdown** 与 **Word `.docx`**——`.docx` 由 `docexport.py` 用纯标准库（zip + WordprocessingML）生成，标题层级、加粗、列表、引用块都会保留，不必额外装 `python-docx`；Word 里打开即可直接改稿。
@@ -406,7 +421,7 @@ python3 web.py --host 0.0.0.0 --port 8000
 
 Web 使用要点：
 
-- 模式：🤖 智能问答 / 📄 仅搜索论文；search 模式可选择排序方式。
+- 模式：🤖 智能问答 / 📄 仅搜索论文；search 模式可选择排序方式。**三种模式各自记住自己上一次的结果**：切换模式时视图跟着切过去（该模式还没跑过就回到空状态并清掉上一个模式的导出/追问/图谱目标），不会把上一个模式的结果留在屏幕上——从「仅搜索论文」切回「智能问答」看到的是那次的回答，不是刚检索出来的论文列表。运行中切换模式不动视图，结果出来时按它自己的模式渲染。
 - 页面顶部是加大的 ScholarMate 标题（左对齐，`Mate` 为主题色）与全宽搜索框（保持最初版式：输入框 + 按钮一行，进度条紧随其下）；首屏内容在视口内垂直居中，不再贴顶，结果变长后自动回到常规文档流（打印样式里已关掉 `min-height`，不会多出空白页）。原先标题旁的两行管线说明已移除，管线细节改由页面底部「🔧 查看管线结构」运行时展示。
 - 检索设置收在一张卡片里：分段式模式切换 → 排序（仅检索）→ 过滤（时间范围 / 仅综述 / 限定期刊会议，venue 匹配的是来源名称如 `arXiv`、`AAAI`、`Nature`，不是出版社名）→ 问答专用行（逐句全文校验、证据评分）。仅检索模式下「逐句全文校验 / 证据评分」整行隐藏（对列表无作用），「🚫 撤稿筛查」只在仅检索模式出现；提交按钮文案随模式在「提问 / 检索」间切换。
 - 阅读与写作友好：主题按钮可切深色/浅色（默认跟随系统，选择记在浏览器本地），浅色适合白天与投影；论文摘要默认只显示三行、点击展开（选中文本复制时不会误折叠）；每篇卡片有「复制引用」（作者 (年). 标题. 刊物. DOI）与「BibTeX」，智能问答结果可「📋 复制 Markdown 回答」直接贴进笔记/Overleaf；页面 `@media print` 已适配，浏览器直接打印/存 PDF 会自动白底黑字并隐藏按钮。
@@ -426,6 +441,9 @@ Web 使用要点：
 - **批量下载文献**：智能问答结果下方「📄 本次工作论文集」标题右侧有「⬇ 批量下载 PDF」，点击后按钮显示已用秒数，完成后浏览器保存 `scholarmate-<运行ID>-pdfs.zip`；提示会告诉你「已打包 N/M 篇开放 PDF」，其余为付费墙，具体原因见 ZIP 内 `download-report.txt`。
 - 筛选留痕：论文卡片上点「纳入 / 排除 / 待定」即记录（可改理由、加备注、清除）；顶部 chip 显示筛选进度；「⬇ PRISMA 筛选表（CSV）」「⬇ 筛选台账（Markdown）」「⬇ 仅纳入文献 BibTeX」在导出工具条上。
 - 证据评分（**仅智能问答模式**）：勾选「⚖️ 证据评分（10 维度加权）」后运行；点「调整维度权重」展开面板，拖动滑杆即时保存（也可点预设一键套用），填「目标物种」后「物种匹配」才会计入；论文卡片上显示总分/等级与维度明细。
+- **🕸 关系图谱**：点任意论文卡片下的「🕸 关系图谱」就能看它周围的引用网络（先行 / 后续 / 像谁）；想换起点，在面板顶部输入框填 **DOI / OpenAlex ID / 论文标题 / 研究主题词** 后回车（填主题词也行：先用 Semantic Scholar 把主题词反查成最相关的一篇）。图谱是一次独立请求（`POST /citegraph`，body: `seed`），不进运行快照；导出用面板上的「SVG 图」与「CSV（节点+边）」。命令行同一份数据：`python3 -c "import citationgraph; g = citationgraph.build('10.1038/s41586-020-2649-2'); print(citationgraph.summary(g))"`。
+- **🕸 整轮全池图谱**：想一次看全这一轮：导出工具条第一项「🕸 本轮全池图谱（N 篇）」，把当前论文池整批交给 `POST /poolgraph`（body: `papers`），拿回来的仍是同一张图界面（拖动、缩放、双击换中心、导出 SVG/CSV 都在），两侧颜色换成 🟣 本轮论文 / 🔵 共同奠基。命令行同一份数据：`python3 -c "import citationgraph, json; papers = json.load(open('outputs/history/<run_id>.json'))['papers']; print(citationgraph.summary(citationgraph.build_pool(papers)))"`。40 篇上下 7-12s，取不到参考文献表的论文在图里是孤点（`warnings` 会说明是数据里没有，不是没查）。
+- **🔍 点圆圈读文献**：图上任意圆圈点一下就出这篇的卡片（作者、刊物、摘要、DOI / PDF / OpenAlex）；本轮工作集里的论文直接用工作集数据（连 BibTeX / 复制引用都有），其余走 `POST /paperinfo`（body: `key`，可给 OpenAlex ID、DOI 或标题，约 1s，前端按节点缓存）。命令行同一道：`python3 -c "import citationgraph; p = citationgraph.paper_info('10.1162/tacl_a_00276'); print(p['title'], p['year'], len(p['abstract']))"`。
 - HTTP API：`POST /ask`（body: `question/mode/sort/window/review_only/venue/deep_verify/score_evidence/screen_retractions/target_species`，`deep_verify=false` 即快速模式）→ 证据评分权重 `GET /scoring`、`POST /scoring`（body: `weights/target_species/preset`）→ `GET /status?id=` → `GET /history`、`GET /history/<id>`；筛选留痕 `GET /screening?run=<id>`、`POST /screening`（body: `run/key/decision/reason/note`，`decision` 为空即清除）；追问对话 `POST /chat`（body: `id/message/allow_retrieve`（默认 true：允许这一轮自己补检索；false 则只基于现有论文作答并返回 `needs_new_search` + `search_query`），`id` 为那次运行的 id；202 返回新的追问 job id，用同一个 `GET /status?id=` 轮询，`status=done` 时 `data.chat_turn` 为本轮回答 + 引用校验；追问仅智能问答可用，未知运行 404、空消息 400、模式不符 400、同一运行已有追问在跑 409，可与 `/cancel` 配合停止）；批量打包 PDF `POST /pdfpack`（body: `id/order`，与 `/export` 同一套显示顺序；返回 `application/zip`，带 `Content-Disposition`、`X-Paper-Count`、`X-Pdf-Count` 响应头，前端据此提示；同步返回，受 `PDFPACK_BUDGET_S` 墙钟上限约束）；领域探索 `POST /explore`（body: `action` = `scope` | `deepen` | `survey`：`scope` 需 `topic`，202 返回新的 `id` 与 `run_id`（会话 id）；`deepen` 需 `id` + `direction`，`path`/`seen` 用来避免重复方向；`survey` 需 `directions`，会新建一次 `mode=survey` 运行。轮询都用同一个 `GET /status?id=`：探索轮次的 `data.explore_turn` 是本层方向，报告轮次返回常规结果数据）；导出 `POST /export`（body: `id/order`，可加 `only=include|exclude|maybe|undecided|screened` 只导出某一筛选子集；响应含 `bibtex/ris/gbt/csl/papers_csv/prisma_csv/prisma_md/evidence_csv` 与 `answer_md`，`answer_docx` 为 `.docx` 的 base64——JSON 走不了二进制，前端解码后另存为文件）；断点续跑 `POST /resume`（body: `id`，对失败或已停止且仍持有断点的任务有效，返回新 job id）；**停止运行** `POST /cancel`（body: `id`）—— 运行中 202（合作式中断，下一个检查点生效）、排队中 202（直接从队列丢弃）、已结束 409、未知 id 404；`GET /status` 附带 `can_cancel` / `can_resume` 与中断时的 `papers_done`/`pool_size`/`rounds_done`。
 
 离线评测：
@@ -440,6 +458,7 @@ python3 eval.py --mode snapshot --snapshots outputs/history   # 快照质量汇�
 - `graph.py` — LangGraph 编排与状态机（主链 `plan_queries → retrieve → rerank → screen_retractions → score_evidence → generate/format_papers → critique(⇄ retrieve) → verify_rules → verify_llm → verify_sentences`；追问支线 `START ⇢ chat_answer ⇢ chat_retrieve ↺ / chat_verify → END`；探索支线 `START ⇢ explore_scope → END` 与 `START ⇢ survey_plan → retrieve → …`，共 16 个节点 / 25 条边）；`run_full()` 返回完整结果状态，`run_explore()` 跑一轮探索，`run()` 为 CLI 兼容包装。
 - `search.py` — 多源检索层（第一梯队 S2/OpenAlex/Scholar + 第二梯队 arXiv/Europe PMC/Crossref），数据源注册表 + 并行调度 + 独立限速/超时 + 失败熔断，过滤、跨源去重合并与溯源、`search_many_detailed` 检索统计，以及按被引量排序的经典锚点通道 `search_classics()`（只对声明了 `sort` 参数的源生效）。
 - `journal.py` — 刊物层级（正刊/子刊/一区–四区）：内置规则、本地分区表（`outputs/journal_tiers.json`，用户写入的行永不被覆盖）、OpenAlex 影响力估算（带并发查询与失败熔断）、每运行一份的 `TierFilter`（`contextvars` 隔离，跑完把统计交给 UI）；Google Scholar 那种被 Google 截断的刊物名（`Advanced Energy …`）一律不猜，按「未分类」处理。
+- `citationgraph.py` — 文献关系图谱。`build(seed)`：给定一篇论文（DOI / OpenAlex ID / 标题，或先用 Semantic Scholar 把主题词反查成 DOI），抓它的「参考了什么」与「被谁引用」，再用共同引用数算两两相似度，返回一份可独立渲染的图数据（节点含年份/被引/核心度/相似度与 prior/derivative 角色，边含 `cites` / `coupled` 两种）。核心度是**图内共被引强度**（先行文献＝种子的引用者里有多少篇也引用它；后续文献＝引用了多少篇本领域奠基工作），不是被引量；跨领域的后续文献会被剔除，剔除后过少则放宽并给出 `warnings`。请求自带 3 次重试（连接级失败尤其常见），并发抓取分批进行。`build_pool(papers)` 是整轮版（`kind="pool"`）：以本轮论文为节点（有 DOI 或 arXiv 号才进图，上限 `POOL_MAX=40`，超出的计入 `stats.truncated`），再加「被 ≥2 篇共同引用的奠基文献」（上限 24 篇）；参考文献表由 Semantic Scholar 一次批处理 POST 取全、缺口用 OpenAlex `referenced_works` 补（OpenAlex id 分块换 DOI 才能求交），节点年份/被引统一取 OpenAlex；核心度分角色归一化（本轮论文＝图内连到几篇同批论文，奠基文献＝本批引用它的篇数），`warnings` 如实记录取不到参考文献表的篇数、跨源补漏失败、孤立点与截断——稀疏是数据本身的形状，不美化。`paper_info(key)` 服务「点开一个圆圈」：key 与建图的起点同一套（OpenAlex ID / DOI / 标题，标题走 `resolve()` 的 S2 兜底），返回一条与检索结果同形的记录（含 OpenAlex `abstract_inverted_index` 还原出的摘要、全部作者、OA PDF 链接、撤稿标记）；取不到返回 `None`，不抛错。
 - `llm.py` — DeepSeek 封装（OpenAI 兼容，读 `.env`）。
 - `verify.py` — 规则校验 + LLM 归因，含结构化 `llm_audit / audit_rules`。
 - `sentences.py` — 逐句证据校验（声明拆分 → 证据检索 → 判决 → 支持论文证据补取），返回结构化 `verdicts`（含 `evidence` 原文片段与 `badge` 证据强度）；`run(answer, papers, pool)` 中 `papers` 必须是回答的编号坐标系（`state["papers"]`）。
@@ -478,6 +497,9 @@ python3 eval.py --mode snapshot --snapshots outputs/history   # 快照质量汇�
 - [x] 历史记录逐条一键导出（不必先「查看」）
 - [x] 智能问答工作论文集批量下载 PDF（ZIP + 清单 + 逐篇下载报告，OpenAlex 开放获取兜底）
 - [x] 领域探索（LangGraph `explore_scope` 支线：领域 → 3-6 个方向 + 高被引代表作预览 → 逐层深入，选定方向后由 `survey_plan` 并入主链产出分节综述报告，复用三层校验与全部导出）
+- [x] 🕸 文献关系图谱（connected-papers 式：颜色＝年份 / 大小＝被引 / 金圈＝图内共被引核心度 / 虚线＝引用、实线＝共同引用；起点支持 DOI、OpenAlex ID、标题或主题词；拖拽与缩放全在浏览器算，可导出 SVG 与 CSV）
+- [x] 🕸 整轮全池图谱（`citationgraph.build_pool` + `POST /poolgraph`：当前论文池整批当种子，一次画出本轮全部论文 + 共同奠基文献；核心度＝图内连接度 / 本批引用篇数）
+- [x] 🕸 点圆圈看这篇文献（`citationgraph.paper_info` + `POST /paperinfo`：本轮论文直接用工作集卡片数据，其余按需取完整记录并按节点缓存；可跳回结果里的那张卡）
 - [x] 追问对话（LangGraph `chat_answer` / `chat_retrieve` / `chat_verify` 支线：先在本轮论文内作答、引用编号一致、每轮规则层校验；**材料不足时自己补检索并追加编号后重答，最多 2 轮**，可开关；对话随快照留痕，导出与论文卡片同步）
 - [x] 回答内 UNSUPPORTED 声明标红 + 结构化校验明细
 - [x] 逐句证据展示支撑原文片段（全文/摘要来源标注 + 原文直链）

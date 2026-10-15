@@ -863,6 +863,12 @@ def _reconstruct_abstract(inverted_index):
     return " ".join(positions[i] for i in sorted(positions))
 
 
+def reconstruct_abstract(inverted_index):
+    """Public wrapper (see http_get_json): citationgraph.py renders the same
+    OpenAlex abstracts when a reader clicks a circle in the graph."""
+    return _reconstruct_abstract(inverted_index)
+
+
 def search_openalex(query, limit=20, sort=None):
     # OpenAlex treats ? and * as search wildcards, which breaks natural-language
     # questions ending in "?" with HTTP 400. Strip them before querying.
