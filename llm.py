@@ -56,6 +56,12 @@ def chat(messages, model=DEFAULT_MODEL, temperature=0.3, max_tokens=2048):
             last_err = e
             if isinstance(e, urllib.error.HTTPError) and e.code not in (429, 500, 502, 503, 504):
                 raise
+            # say so: a retry storm is invisible otherwise, and it is what a
+            # slow stage under a flaky network actually is (a four-call probe
+            # of this endpoint failed once with an SSL EOF while the
+            # per-sentence stage was being timed, and each retry costs 2-6s)
+            print(f"      [warn] DeepSeek call failed ({type(e).__name__}: {e}); "
+                  f"retry {attempt + 2}/3")
             time.sleep(2 * (attempt + 1))
     else:
         raise RuntimeError(f"DeepSeek request failed after 3 attempts: {last_err}")

@@ -886,7 +886,11 @@ def node_critique(state):
 def node_verify_rules(state):
     _emit("⑦ 三层校验 1/3：引用规则校验")
     try:
-        audit = verify.audit_rules(state["answer"], state["papers"])
+        # `directions` (survey runs) switches on the report-shape checks: the
+        # rule layer is the only layer that knows what the report was supposed
+        # to contain, because the plan is still in state.
+        audit = verify.audit_rules(state["answer"], state["papers"],
+                                   directions=state.get("directions"))
     except Exception as e:
         audit = {
             "lines": ["--- Citation verification ---", f"BAD rule check failed: {e}"],

@@ -22,7 +22,25 @@ import rerank
 import search
 import verify
 
-MAX_CLAIMS = 8
+# How much of a long answer gets sentence-level verification. An ask-mode answer
+# is prose, so one pass over it with a low cap is right; a survey is 4-8
+# sections and 25-46 cited sentences, and flattening that into 8 merged claims
+# (measured on ten saved surveys: 8 verdicts against 25-46 cited sentences)
+# leaves most of the report unchecked and mixes three papers into one verdict.
+# Sections therefore get their own pass and their own cap, and the total is
+# capped so a pathological outline cannot explode the stage.
+MAX_CLAIMS = 8              # a sectionless answer (ask mode) keeps the old cap
+MAX_CLAIMS_PER_SECTION = 4
+MAX_CLAIMS_TOTAL = 24
+SPLIT_WORKERS = int(os.environ.get("CLAIM_SPLIT_WORKERS", "4"))
+# full-text reasons that mean "we tried and did not get the text", as opposed to
+# "this paper has no open full text at all" (see fulltext.get_fulltext)
+_FETCH_FAILURES = ("download failed", "timed out", "text extraction failed",
+                   "extraction busy", "deadline reached", "unavailable in a recent run",
+                   # a landing page a publisher handed a bot instead of the PDF:
+                   # the download happened and yielded no readable paper, so the
+                   # verdict rests on absent evidence exactly like a 403 does
+                   "landing page")
 EXTRA_EVIDENCE_BUDGET = 4  # global cap on full-text fetches for supporting-but-uncited papers
 EXTRA_PER_CLAIM = 1        # at most one such fetch per claim (enough to prove full-text support)
 # The per-sentence stage is dominated by LLM calls (passage rerank per cited
@@ -45,12 +63,21 @@ EVIDENCE_SOURCES = tuple(
 JUDGE_WORKERS = int(os.environ.get("CLAIM_JUDGE_WORKERS", "3"))
 EVIDENCE_PER_CLAIM = 5
 
-SPLIT_PROMPT = """Split the following literature answer into its key factual \
-claims. Each claim should be a single statement asserting something about the \
-literature (usually a sentence or clause, keeping any citation [n]). Reply \
-ONLY with JSON:
+SPLIT_PROMPT = """Split the following literature text into its factual claims. \
+Each claim is a single statement asserting something about the literature \
+(usually a sentence or clause, keeping any citation [n] exactly as written). \
+Reply ONLY with JSON:
 {"claims": [{"id": 1, "text": "...", "citations": [n, ...]}]}
-Rules: max 8 claims; merge trivial filler sentences; keep exact wording."""
+Rules: at most {cap} claims; pick the claims that carry the substance (a result, \
+a method, a comparison, a limitation) rather than the filler; keep exact wording \
+-- do not rewrite, translate, merge or summarise."""
+
+
+def _split_prompt(cap):
+    """SPLIT_PROMPT with its cap filled in. str.format() cannot be used on it:
+    the JSON skeleton in the prompt is full of braces."""
+    return SPLIT_PROMPT.replace("{cap}", str(cap))
+
 
 JUDGE_PROMPT = """You are checking whether each claim in an answer is supported \
 by the provided papers. A claim is supported only if at least one paper's \
@@ -78,11 +105,26 @@ def _extract_claims_fallback(content):
     return claims
 
 
-def split_claims(answer):
+def _citation_numbers(value):
+    out = []
+    for n in value or []:
+        try:
+            out.append(int(n))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _split_one(text, cap):
+    """One splitter call over `text` -> [{"text", "citations"}].
+
+    Raises when the model cannot be reached at all, so the caller can choose
+    between a retry and the local fallback.
+    """
     content = llm.chat(
         [
-            {"role": "system", "content": SPLIT_PROMPT},
-            {"role": "user", "content": answer},
+            {"role": "system", "content": _split_prompt(cap)},
+            {"role": "user", "content": text},
         ],
         max_tokens=1024,
         temperature=0,
@@ -93,23 +135,144 @@ def split_claims(answer):
         result = None
     if not isinstance(result, dict):
         result = {"claims": _extract_claims_fallback(content)}
-    claims = []
+    out = []
     for c in result.get("claims", []):
-        text = str(c.get("text", "")).strip()
-        if not text:
+        claim = str(c.get("text", "")).strip()
+        if claim:
+            out.append({"text": claim, "citations": _citation_numbers(c.get("citations"))})
+    return out[:cap]
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？；;!?])\s*|\n+")
+
+
+def _local_claims(text, cap):
+    """Last-resort split: the cited sentences of `text`, verbatim.
+
+    Only reached when the splitter call fails, so that one HTTP error costs
+    resolution (a whole sentence instead of the substance clause inside it)
+    instead of zeroing out the whole layer. A sentence with no [n] has nothing
+    to be checked against, so it is dropped.
+    """
+    out = []
+    for raw in _SENTENCE_SPLIT_RE.split(text or ""):
+        sentence = re.sub(r"[ \t]+", " ", raw).strip(" \t*-#>•")
+        if len(sentence) < 12 or not re.search(r"\[\d+\]", sentence):
             continue
+        out.append({"text": sentence,
+                    "citations": [int(n) for n in re.findall(r"\[(\d+)\]", sentence)]})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _with_citations(claims):
+    """Keep the claims that point at a paper.
+
+    The per-sentence layer exists to check citations, and a statement carrying
+    no [n] has nothing to be checked against: judged against the paper list it
+    would come back 不支持 and report the report's own framing ("本次检索未覆盖
+    湿实验验证…") as an unsupported finding. The numbers are read off the claim
+    text, which is what the answer actually says, and the model's own list is
+    only a fallback.
+    """
+    out = []
+    for c in claims:
+        numbers = [int(n) for n in re.findall(r"\[(\d+)\]", c["text"])]
+        if not numbers:
+            numbers = c.get("citations") or []
+        if not numbers:
+            continue
+        out.append({"text": c["text"], "citations": numbers})
+    return out
+
+
+def _split_claims(text, cap):
+    """Split one block of text: one call, one retry, then the local fallback."""
+    for attempt in (1, 2):
+        _check_cancel()
         try:
-            cid = int(c.get("id", len(claims) + 1))
-        except (TypeError, ValueError):
-            cid = len(claims) + 1
-        citations = []
-        for n in c.get("citations", []):
-            try:
-                citations.append(int(n))
-            except (TypeError, ValueError):
-                pass
-        claims.append({"id": cid, "text": text, "citations": citations})
-    return claims[:MAX_CLAIMS]
+            claims = _with_citations(_split_one(text, cap))
+        except Exception as e:
+            _check_cancel()      # re-raises when the failure *is* the stop request
+            print(f"      [warn] claim split failed ({type(e).__name__}: {e})")
+            claims = []
+        if claims:
+            return claims
+        if attempt == 1:
+            time.sleep(1.5)
+    claims = _local_claims(text, cap)
+    print(f"      [warn] splitter unavailable for a section; fell back to "
+          f"{len(claims)} of its cited sentences")
+    return claims
+
+
+def split_claims(answer):
+    """Claims of an unstructured answer: one call, the flat cap."""
+    return [dict(c, id=n) for n, c in enumerate(_split_claims(answer, MAX_CLAIMS), 1)]
+
+
+_BIB_SECTIONS = ("references", "reference", "参考文献", "引用文献", "文献列表",
+                 "literaturecited", "bibliography")
+
+
+def _split_targets(answer):
+    """Sections worth their own splitter call: prose that cites something.
+
+    A bibliography is `[n] Title (Year)` lines with nothing to verify and a
+    section without a single [n] has nothing that a paper could be checked
+    against, so neither is split (the rule layer still complains about a
+    direction section that cites nothing -- see verify.survey_items).
+    """
+    out = []
+    for title, body in verify.split_sections(answer):
+        if not body or not re.search(r"\[\d+\]", body):
+            continue
+        if title and any(bib in verify.norm_key(title) for bib in _BIB_SECTIONS):
+            continue
+        out.append((title, body))
+    return out
+
+
+def split_report_claims(answer):
+    """Claims of a report, one splitter call per section.
+
+    Measured on the ten saved surveys: the flat pass returned 8 claims for the
+    25-46 cited sentences a report carries -- 17%-32% of the report checked --
+    and merged statements from different sections into a single verdict. Here
+    every section gets its own call and its own cap, and the section title
+    travels with each claim, so a verdict can be read next to the part of the
+    report it belongs to.
+
+    The per-section cap is derived from the report's own length, so the total
+    stays under MAX_CLAIMS_TOTAL without dropping a section: 8 sections get 3
+    claims each, 4 sections get 4 each. Section calls are independent model
+    calls, so they run concurrently. An answer with no headings at all (ask
+    mode) keeps the flat path above.
+    """
+    sections = _split_targets(answer)
+    if not sections or (len(sections) == 1 and not sections[0][0]):
+        # one block of text with no heading above it: the flat pass, one call,
+        # the old cap (MAX_CLAIMS)
+        return split_claims(answer)
+    per_section = max(1, min(MAX_CLAIMS_PER_SECTION, MAX_CLAIMS_TOTAL // len(sections)))
+    results = [None] * len(sections)
+    workers = max(1, min(SPLIT_WORKERS, len(sections)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(contextvars.copy_context().run, _split_claims, body, per_section): i
+            for i, (_title, body) in enumerate(sections)
+        }
+        for fut in as_completed(futures):
+            results[futures[fut]] = fut.result()
+    claims = []
+    for (title, _body), got in zip(sections, results):
+        for c in got or []:
+            claims.append({"id": len(claims) + 1, "text": c["text"],
+                           "citations": c["citations"], "section": title})
+    print(f"      {len(sections)} section(s) -> {len(claims)} claims "
+          f"(<= {per_section} per section)")
+    return claims
 
 
 def _query_from_claim(text):
@@ -196,6 +359,19 @@ def retrieve_evidence_many(claims, pool):
     return added_by_claim
 
 
+def fetch_failed(note):
+    """True when a full-text attempt was made and produced no text.
+
+    The notes come from fulltext.get_fulltext (see _FETCH_FAILURES). A network
+    error, a publisher refusing the PDF or an extraction that ran out of time
+    all leave the judge with the abstract alone -- which is a check we could not
+    run, not a result. Public because the UI re-derives the same classification
+    for snapshots saved before badges existed.
+    """
+    low = (note or "").lower()
+    return any(marker in low for marker in _FETCH_FAILURES)
+
+
 def _support_badge(supported, supporting, evidence):
     """Classify how strong the support for one claim is.
 
@@ -205,8 +381,19 @@ def _support_badge(supported, supporting, evidence):
       abstract    -- single paper, judged from the abstract only
       unknown     -- judged supported, but no source text was retrieved
       unsupported -- not backed by the evidence
+      unfetched   -- judged unsupported, but a cited paper's text never
+                     arrived, so the verdict rests on absent evidence
     """
     if not supported:
+        failed = [e for e in evidence if fetch_failed(e.get("note"))]
+        if failed:
+            # seen on a real run: a claim about scPILOT was judged 不支持 while
+            # the only evidence record for it said "download failed: HTTP
+            # Error 403" -- the paper's text was never read, so the verdict was
+            # about a document nobody had opened
+            notes = "; ".join(dict.fromkeys(e["note"] for e in failed if e.get("note")))
+            return ("unfetched", "无法核对（原文未取到）",
+                    f"本次未取到可核对原文（{notes}），判决无从核对——不等于不支持")
         return "unsupported", "不支持", "判决：该声明未被证据支持"
     sup = set(supporting)
     sup_ev = [e for e in evidence if e.get("n") in sup]
@@ -273,13 +460,20 @@ def _paper_evidence(claim, paper, n, allow_fetch=True, in_answer=True):
     if not abstract:
         return None, blocks
     entry = _evidence_meta(paper, n, in_answer)
+    window = abstract[:verify.ABSTRACT_EVIDENCE_CHARS]
     entry.update({
         "source": "abstract",
         "note": note if allow_fetch else "abstract only",
         "url": paper.get("url") or "",
         "pdf_url": fulltext.pdf_url_for(paper),
-        "passages": [{"text": abstract[:600], "score": None}],
+        "passages": [{"text": window, "score": None}],
     })
+    # Put the recorded reason on the evidence *and* in the judge's prompt. Until
+    # now a cited paper with no full text contributed nothing to the prompt but
+    # its 400-char line in the shared paper list, so "the whole abstract does
+    # not back this claim" was decided on a fraction of the abstract.
+    blocks.append(f"Abstract of [{n}] {paper['title']} ({entry['note']}):")
+    blocks.append(f"  | {window}")
     return entry, blocks
 
 
@@ -497,6 +691,7 @@ def judge_claims(claims, papers, answer_count=None):
         structured.append({
             "id": c["id"],
             "text": c["text"],
+            "section": c.get("section"),
             "citations": c.get("citations", []),
             "supported": supported,
             "supporting": supporting,
@@ -517,6 +712,14 @@ def judge_claims(claims, papers, answer_count=None):
         )
         if supported:
             lines.append(("ok", f"Claim {item['id']}: SUPPORTED ({', '.join(titles) or 'cited papers'})"))
+        elif item["badge"] == "unfetched":
+            # not a failure of the answer: the check did not happen, so the log
+            # says so instead of reporting the claim as unsupported
+            lines.append((
+                "warn",
+                f"Claim {item['id']}: UNCHECKED (no source text retrieved) -> {c[:110]}"
+                f" | {item['badge_note']}",
+            ))
         else:
             lines.append((
                 "bad",
@@ -533,6 +736,32 @@ def _cited_papers(claims, papers):
             if isinstance(n, int) and 1 <= n <= len(papers):
                 idx.add(n)
     return [papers[i - 1] for i in sorted(idx)]
+
+
+def _offer_alternative_urls(papers):
+    """Ask OpenAlex for an open-access copy of every cited paper that needs one.
+
+    Two groups qualify. A paper with no PDF URL at all never gets a download
+    attempt: on the ten saved surveys that was 84 of 243 cited papers (35%).
+    A paper whose URL already failed (the marker on disk says so) is worth a
+    second address -- "HTTP Error 403: Forbidden" is the most common reason in
+    the skip markers (50 of 102), and publishers point bots at a landing page
+    while the copy in a repository stays open. One batched request per 50 DOIs
+    costs a second or so, and papers that already have a working address are
+    not asked about. Never fatal: no answer just means the stage runs as before.
+    """
+    needed = [p for p in papers if not fulltext.pdf_url_for(p) or fulltext.is_known_bad(p)]
+    if not needed:
+        return
+    try:
+        mapping = search.openalex_oa_pdf_urls(needed)
+    except Exception as e:
+        print(f"      [warn] OpenAlex open-access lookup failed ({e}); continuing")
+        return
+    fulltext.set_oa_urls(mapping)
+    if mapping:
+        print(f"      Open-access fallback: {len(mapping)}/{len(needed)} of the papers "
+              f"with no working URL got a second address from OpenAlex")
 
 
 def run(answer, papers, pool=None, deadline_s=None, should_cancel=None):
@@ -591,7 +820,7 @@ def _check_cancel():
 def _run(answer, papers, pool):
     _check_cancel()      # the caller may have stopped us before the first LLM call
     print("      Splitting answer into claims...")
-    claims = split_claims(answer)
+    claims = split_report_claims(answer)
     if not claims:
         empty = ["--- Per-sentence evidence check ---", "      no claims extracted"]
         return {"lines": empty, "verdicts": [], "passages_used": 0,
@@ -612,6 +841,7 @@ def _run(answer, papers, pool):
         # downloads are the slowest single step of this stage: check first so a
         # stop does not sit through the whole prefetch
         _check_cancel()
+        _offer_alternative_urls(cited)
         t0 = time.monotonic()
         scheduled = fulltext.prefetch_fulltexts(cited)
         if scheduled:

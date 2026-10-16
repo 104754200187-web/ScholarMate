@@ -35,6 +35,11 @@ MIN_TEXT_CHARS = 200
 _UA = "Mozilla/5.0 (X11; Linux x86_64) research-agent/0.1 (literature agent)"
 _ARXIV_ABS = re.compile(r"arxiv\.org/(?:abs|pdf)/([^/?#]+)")
 _memo = {}  # cache key -> (text, note); avoids re-downloading within a run
+# DOI -> openly available PDF URL, filled once per run by the caller from
+# OpenAlex (search.openalex_oa_pdf_urls). Merged rather than replaced: a DOI
+# names one paper no matter which run asked, so a second run's map can only add
+# addresses. Used for papers whose own URL is missing or known to fail only.
+_oa_urls = {}
 
 # Latency controls. A slow PDF used to cost up to timeout*retries (~180s); with
 # a shorter timeout and fewer retries the worst case is ~50s, and downloads run
@@ -65,6 +70,10 @@ STATS = {
     "cache_hits": 0,       # served from fulltext_cache/ on disk
     "downloads": 0,
     "download_failed": 0,
+    "oa_fallbacks": 0,     # attempts at the OpenAlex OA copy: the address the
+                           # paper would otherwise never have had, or its second
+                           # one after the first failed
+    "html_resolved": 0,    # PDF reached through the landing page's own link
     "deadline_skips": 0,
     "too_large_skips": 0,  # PDF bigger than MAX_PDF_BYTES
     "extract_timeouts": 0, # extraction exceeded EXTRACT_TIMEOUT
@@ -134,7 +143,13 @@ def _key_lock(key):
         return lock
 
 
-_skips = {}              # cache key -> {"reason", "at"}; persisted next to the cache
+# cache key -> {address: {"reason", "at", "ttl"}}, persisted next to the cache.
+# Per address, because one paper can be reachable at two: the URL a search
+# result carried and the open-access copy OpenAlex knows. Storing one marker
+# per paper let the second failure erase the first, so the expensive address
+# that already 403'd came back every other run.
+_SKIP_ANY = "*"          # a marker that applies to whatever address is asked
+_skips = {}
 _skips_loaded = False
 _skip_lock = threading.Lock()
 
@@ -153,26 +168,76 @@ def _load_skips():
         _skips = loaded if isinstance(loaded, dict) else {}
     except Exception:
         _skips = {}
+    for key, rec in list(_skips.items()):
+        _skips[key] = _migrated(rec)
     _skips_loaded = True
 
 
-def _skip_reason(key):
-    """Why this paper's full text was given up on recently ("" if it was not)."""
+def _migrated(rec):
+    """One paper's marker as {address: {"reason", "at", "ttl"}}.
+
+    Files written before addresses were recorded hold a single flat record
+    ({reason, at, ttl, url}); it is read as a marker for that one address, or
+    -- when it names none -- for whatever address is asked about.
+    """
+    if not isinstance(rec, dict):
+        return {}
+    if "reason" in rec or "at" in rec:
+        return {((rec.get("url") or "").strip() or _SKIP_ANY): {
+            "reason": rec.get("reason") or "full text unavailable",
+            "at": rec.get("at") or 0,
+            "ttl": rec.get("ttl"),
+        }}
+    return {addr: slot for addr, slot in rec.items() if isinstance(slot, dict)}
+
+
+def _fresh(slot):
+    """The reason a marker still stands for, or "" once it has expired."""
+    ttl = float(slot.get("ttl") or SKIP_TTL)
+    if time.time() - float(slot.get("at") or 0) > ttl:
+        return ""
+    return slot.get("reason") or "full text unavailable"
+
+
+def _save_skips():
+    try:
+        atomicio.write_json(_skips_path(), _skips)
+    except Exception:
+        pass
+
+
+def _skip_reason(key, url=""):
+    """Why this paper's full text was given up on recently ("" if it was not).
+
+    Markers are per address: a publisher answering 403 for the URL a search
+    result carried says nothing about the open-access copy OpenAlex knows, so
+    that second address stays worth a try. Passing no `url` asks about the
+    paper rather than one address (see is_known_bad).
+    """
     if not SKIP_TTL:
         return ""
     with _skip_lock:
         _load_skips()
-        rec = _skips.get(key)
-        if not rec:
+        slots = _skips.get(key)
+        if not slots:
             return ""
-        ttl = float(rec.get("ttl") or SKIP_TTL)
-        if time.time() - float(rec.get("at") or 0) > ttl:
+        # the address asked about, then any marker that names no address
+        order = dict.fromkeys([url, _SKIP_ANY]) if url else dict.fromkeys(slots)
+        for addr in order:
+            slot = slots.get(addr)
+            if not slot:
+                continue
+            reason = _fresh(slot)
+            if reason:
+                return reason
+            slots.pop(addr, None)   # expired: forget this address only
+        if not slots:
             _skips.pop(key, None)
-            return ""
-        return rec.get("reason") or "full text unavailable"
+        _save_skips()
+        return ""
 
 
-def _mark_skip(key, reason, ttl=None):
+def _mark_skip(key, reason, ttl=None, url=""):
     """Remember a terminal failure so the next run skips this PDF outright."""
     if not SKIP_TTL:
         return
@@ -182,22 +247,19 @@ def _mark_skip(key, reason, ttl=None):
         return
     with _skip_lock:
         _load_skips()
-        _skips[key] = {"reason": str(reason)[:200], "at": time.time(), "ttl": ttl}
-        try:
-            atomicio.write_json(_skips_path(), _skips)
-        except Exception:
-            pass
+        slots = _skips.setdefault(key, {})
+        slots[((url or "").strip()[:500] or _SKIP_ANY)] = {
+            "reason": str(reason)[:200], "at": time.time(), "ttl": ttl}
+        _save_skips()
 
 
 def _clear_skip(key):
+    """Forget every marker for this paper -- one of its addresses worked."""
     with _skip_lock:
         _load_skips()
         if _skips.pop(key, None) is None:
             return
-        try:
-            atomicio.write_json(_skips_path(), _skips)
-        except Exception:
-            pass
+        _save_skips()
 
 
 def _arxiv_wait(url):
@@ -488,6 +550,80 @@ def pdf_url_for(paper):
     return ""
 
 
+def doi_key(value):
+    """Normalise a DOI from a paper dict or a raw string."""
+    doi = value.get("doi") if isinstance(value, dict) else value
+    doi = (doi or "").strip().lower()
+    return re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
+
+
+def set_oa_urls(mapping):
+    """Remember the open-access PDF URLs a caller looked up (see sentences.py)."""
+    if mapping:
+        _oa_urls.update(mapping)
+
+
+def alternative_pdf_url(paper):
+    """A second address for this paper's PDF, or "" -- the OpenAlex OA copy.
+
+    The per-sentence stage asks OpenAlex about the papers that need this (no
+    URL of their own, or a URL that failed before) and hands the answer over
+    with set_oa_urls. Addresses we already have are not repeated.
+    """
+    key = doi_key(paper)
+    url = _oa_urls.get(key) if key else ""
+    return url if url and url != pdf_url_for(paper) else ""
+
+
+def is_known_bad(paper):
+    """True when this paper's full text was given up on recently.
+
+    The per-sentence stage uses it to decide which papers are worth asking
+    OpenAlex about: a 403 on the URL a search result carried does not rule out
+    an open-access copy somewhere else.
+    """
+    return bool(_skip_reason(_cache_key(paper)))
+
+
+# Publishers answer a bot with a landing page long before a PDF: OUP / SAGE /
+# Wiley / MDPI all advertise the real file in `<meta name="citation_pdf_url">`.
+_CITATION_PDF = re.compile(
+    rb"""<meta[^>]+name=["']citation_pdf_url["'][^>]*?content=["']([^"']+)["']""",
+    re.I)
+_CITATION_PDF_REV = re.compile(
+    rb"""<meta[^>]+content=["']([^"']+)["'][^>]*?name=["']citation_pdf_url["']""",
+    re.I)
+_HTML_PDF_LINK = re.compile(rb"""href=["']([^"'\s]+\.pdf[^"'\s]*)["']""", re.I)
+
+
+def pdf_link_from_html(data, base=""):
+    """The PDF URL a landing page advertises, or "".
+
+    Returns an absolute URL: the meta tag is both the cheapest and the most
+    reliable thing to look for, and it is preferred over a bare `.pdf` link.
+    """
+    head = data[:200_000]
+    m = _CITATION_PDF.search(head) or _CITATION_PDF_REV.search(head)
+    if not m:
+        m = _HTML_PDF_LINK.search(head)
+    if not m:
+        return ""
+    url = m.group(1).decode("utf-8", "ignore").strip()
+    url = url.replace("&amp;", "&")
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("/") and base:
+        m2 = re.match(r"(https?://[^/]+)", base)
+        if m2:
+            return m2.group(1) + url
+    return url if url.startswith("http") else ""
+
+
+def looks_like_pdf(data):
+    """True when these bytes are a PDF rather than an HTML landing page."""
+    return bool(data[:5].startswith(b"%PDF") or b"%PDF" in data[:1024])
+
+
 def _cache_key(paper):
     aid = (paper.get("arxiv_id") or "").strip()
     if aid:
@@ -529,10 +665,86 @@ def _extract_guarded(data):
     return box.get("text", ""), ""
 
 
+def _download(key, url):
+    """Download one candidate URL. Returns (data, error) -- never raises."""
+    if _deadline_hit():
+        _bump("deadline_skips")
+        return None, "full-text stage deadline reached"
+    _arxiv_wait(url)
+    t0 = time.monotonic()
+    try:
+        data = _http_get(url)
+    except Exception as e:
+        _bump("download_failed")
+        if "too large" in str(e):
+            _bump("too_large_skips")
+        return None, f"download failed: {e}"
+    _bump("downloads")
+    _bump("bytes", len(data))
+    _bump("download_seconds", time.monotonic() - t0)
+    return data, ""
+
+
+def _read_one(key, path, url):
+    """Fetch and extract one candidate URL's text.
+
+    Returns (text, note): text is "" on failure and note says why. Terminal
+    failures are remembered on disk against *this* URL, so a second address for
+    the same paper stays worth a try on the next run.
+    """
+    data, err = _download(key, url)
+    if err:
+        _mark_skip(key, err, url=url)
+        return "", err
+    if not looks_like_pdf(data):
+        # publishers hand a bot a landing page: the PDF is the link it carries
+        inner = pdf_link_from_html(data, url)
+        if not inner:
+            err = "landing page carried no PDF link"
+            _mark_skip(key, err, url=url)
+            return "", err
+        _bump("html_resolved")
+        data2, err2 = _download(key, inner)
+        if err2 or not looks_like_pdf(data2):
+            err = err2 or "landing page did not yield a PDF"
+            _mark_skip(key, err, url=url)
+            return "", err
+        data = data2
+    if _deadline_hit():
+        _bump("deadline_skips")
+        return "", "full-text stage deadline reached"
+    t1 = time.monotonic()
+    text, note = _extract_guarded(data)
+    _bump("extract_seconds", time.monotonic() - t1)
+    if not text:
+        # a per-paper failure (unreadable / too slow); "extraction busy" is
+        # only a slot shortage, so it is retried by the next run
+        if note != "extraction busy":
+            # how fast the pure-stdlib extractor is depends on this machine,
+            # not on the paper, so a timeout expires quickly
+            ttl = SKIP_TTL_TRANSIENT if "timed out" in (note or "") else None
+            _mark_skip(key, note or "text extraction failed", ttl=ttl, url=url)
+        return "", note or "text extraction failed"
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) < MIN_TEXT_CHARS:
+        err = f"text extraction failed ({len(text)} chars)"
+        _mark_skip(key, err, url=url)
+        return "", err
+    atomicio.write_text(path, text)
+    return text, f"fulltext ({len(text)} chars)"
+
+
 def get_fulltext(paper):
     """Return (text, note) for a paper. Text is cached in memory for the run
     and on disk under fulltext_cache/, so repeat questions are download-free.
-    Safe to call from several threads; it never raises."""
+    Safe to call from several threads; it never raises.
+
+    Two addresses are tried at most: the one the paper came with, and -- when
+    the caller handed one over with set_oa_urls -- the open-access copy OpenAlex
+    knows for its DOI. That covers the two ways a paper ends up abstract-only
+    without anyone reading it: no PDF URL in the record at all, and a publisher
+    answering 403 to a bot at the URL the search result carried.
+    """
     if not ENABLED:
         return "", "fulltext disabled"
     key = _cache_key(paper)
@@ -551,58 +763,36 @@ def get_fulltext(paper):
             _memo[key] = (text, "cached")
             _bump("cache_hits")
             return _memo[key]
-        pdf = pdf_url_for(paper)
-        if not pdf:
+        alt = alternative_pdf_url(paper)   # OpenAlex's copy, "" when unknown
+        candidates = list(dict.fromkeys([u for u in (pdf_url_for(paper), alt) if u]))
+        if not candidates:
             _memo[key] = ("", "no full-text URL")
             return _memo[key]
-        known_bad = _skip_reason(key)
-        if known_bad:
+        skipped = [_skip_reason(key, url) for url in candidates]
+        if all(skipped):
             _bump("skip_markers")
-            _memo[key] = ("", f"skipped, unavailable in a recent run: {known_bad}")
+            _memo[key] = ("", f"skipped, unavailable in a recent run: {skipped[0]}")
             return _memo[key]
-        if _deadline_hit():
-            _bump("deadline_skips")
-            _memo[key] = ("", "full-text stage deadline reached")
-            return _memo[key]
-        _arxiv_wait(pdf)
-        t0 = time.monotonic()
-        try:
-            data = _http_get(pdf)
-        except Exception as e:
-            _bump("download_failed")
-            if "too large" in str(e):
-                _bump("too_large_skips")
-            _mark_skip(key, str(e))
-            _memo[key] = ("", f"download failed: {e}")
-            return _memo[key]
-        _bump("downloads")
-        _bump("bytes", len(data))
-        _bump("download_seconds", time.monotonic() - t0)
-        if _deadline_hit():
-            _bump("deadline_skips")
-            _memo[key] = ("", "full-text stage deadline reached")
-            return _memo[key]
-        t1 = time.monotonic()
-        text, note = _extract_guarded(data)
-        _bump("extract_seconds", time.monotonic() - t1)
-        if not text:
-            # a per-paper failure (unreadable / too slow); "extraction busy" is
-            # only a slot shortage, so it is retried by the next run
-            if note != "extraction busy":
-                # how fast the pure-stdlib extractor is depends on this
-                # machine, not on the paper, so a timeout expires quickly
-                ttl = SKIP_TTL_TRANSIENT if "timed out" in (note or "") else None
-                _mark_skip(key, note or "text extraction failed", ttl=ttl)
-            _memo[key] = ("", note or "text extraction failed")
-            return _memo[key]
-        text = re.sub(r"\s+", " ", text).strip()
-        if len(text) < MIN_TEXT_CHARS:
-            _mark_skip(key, f"text extraction failed ({len(text)} chars)")
-            _memo[key] = ("", f"text extraction failed ({len(text)} chars)")
-            return _memo[key]
-        atomicio.write_text(path, text)
-        _clear_skip(key)
-        _memo[key] = (text, f"fulltext ({len(text)} chars)")
+        last_err = ""
+        for i, url in enumerate(candidates):
+            if skipped[i]:
+                _bump("skip_markers")
+                last_err = f"skipped, unavailable in a recent run: {skipped[i]}"
+                continue
+            if alt and url == alt:
+                # also when the OA copy is the paper's only address: that is
+                # the 84-of-243 case this lookup exists for
+                _bump("oa_fallbacks")
+            text, note = _read_one(key, path, url)
+            if text:
+                _clear_skip(key)
+                _memo[key] = (text, note)
+                return _memo[key]
+            if "deadline reached" in note:
+                _memo[key] = ("", note)
+                return _memo[key]
+            last_err = note
+        _memo[key] = ("", last_err or "no full text")
         return _memo[key]
 
 
@@ -614,7 +804,7 @@ def prefetch_fulltexts(papers):
     becomes ~N/PREFETCH_WORKERS rounds. Returns how many were scheduled."""
     todo = {}
     for p in papers:
-        if not p or not pdf_url_for(p):
+        if not p or not (pdf_url_for(p) or alternative_pdf_url(p)):
             continue
         key = _cache_key(p)
         if key in _memo:

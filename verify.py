@@ -13,6 +13,124 @@ import llm
 
 REF_LINE = re.compile(r"^\s*\[(\d+)\]\s*(.+?)\s*$")
 REF_YEAR = re.compile(r"\s*\(\d{4}\)\s*$")
+SECTION_RE = re.compile(r"^##[ \t]*(.+?)[ \t]*$", re.MULTILINE)
+
+# How much of a cited paper's abstract is shown as evidence when no full text
+# could be read. The generator is shown 800 chars per paper (graph.build_context)
+# while this layer was cut to 600, so a fact stated in the tail of an abstract
+# (method, inclusion criteria, limitation) could reach the writer but not the
+# judge that clears it.
+ABSTRACT_EVIDENCE_CHARS = 1200
+
+
+def split_sections(answer):
+    """Split a report into (title, body) pairs on its `##` headings.
+
+    Text before the first heading is kept as a (None, text) pair so nothing is
+    dropped, and a text with no headings at all comes back as one (None, text)
+    pair. The per-sentence splitter (sentences.py) and the survey rule checks
+    below both read a report through this function, so "which section is this"
+    means the same thing in both layers.
+    """
+    text = answer or ""
+    marks = list(SECTION_RE.finditer(text))
+    if not marks:
+        return [(None, text)]
+    out = []
+    head = text[:marks[0].start()].strip()
+    if head:
+        out.append((None, head))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out.append((m.group(1).strip(), text[m.end():end].strip()))
+    return out
+
+
+def norm_key(text):
+    """Lowercased alphanumerics plus CJK, so 「RNA基础模型」 matches 「RNA 基础模型」."""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (text or "").lower())
+
+
+# Section titles a survey report may carry besides the chosen directions
+# (SURVEY_PROMPT asks for 摘要 / 争议与空白 / 参考文献; the rest are harmless
+# variants a writer reaches for).
+_EXTRA_SECTIONS = (
+    "摘要", "abstract", "summary", "小结", "总结", "引言", "introduction",
+    "争议与空白", "空白", "gaps", "openquestions", "limitations", "局限",
+    "讨论", "discussion", "结论", "conclusion", "展望", "outlook",
+    "参考文献", "references", "引用文献", "文献列表",
+)
+
+
+def _direction_key(direction, index):
+    """Stable id for a direction, so the "missing section" check can look it up."""
+    return direction.get("id") if direction.get("id") not in (None, "") else index
+
+
+def _match_direction(title, directions):
+    """The direction a section title names, or None."""
+    key = norm_key(title)
+    if not key:
+        return None
+    best = None
+    for d in directions:
+        for field in ("name", "en"):
+            name = norm_key(d.get(field))
+            if len(name) < 4:
+                continue
+            if name in key or (len(key) >= 4 and key in name):
+                return d
+            ratio = difflib.SequenceMatcher(None, name, key).ratio()
+            if ratio >= 0.6 and (best is None or ratio > best[0]):
+                best = (ratio, d)
+    return best[1] if best else None
+
+
+def survey_items(answer, directions):
+    """Rule items that only make sense for a structured survey report.
+
+    The report's contract (see SURVEY_PROMPT) is one `##` section per chosen
+    direction, every one of them carrying [n] citations. These checks catch the
+    report and the plan drifting apart -- a direction that was searched but
+    never written up, a section with nothing checkable in it, a section that
+    belongs to no direction. None of them fired on the ten saved surveys (each
+    direction had a section with >=6 distinct citations), so they are guards
+    rather than fixes; they cost one pass over the text and name the section
+    they complain about.
+    """
+    if not directions:
+        return []
+    items = []
+    seen = set()
+    for title, body in split_sections(answer):
+        if not title:
+            continue
+        direction = _match_direction(title, directions)
+        if direction is not None:
+            seen.add(_direction_key(direction, directions.index(direction)))
+            if not extract_citations(body):
+                items.append({
+                    "status": "warn",
+                    "message": f"方向小节「{title}」没有任何 [n] 引用：这一节的结论无从核对",
+                })
+            continue
+        key = norm_key(title)
+        if any(extra in key for extra in _EXTRA_SECTIONS):
+            continue
+        items.append({
+            "status": "warn",
+            "message": f"报告里有目录外的小节「{title}」：它不属于本次选定的 "
+                       f"{len(directions)} 个方向",
+        })
+    for i, d in enumerate(directions):
+        if _direction_key(d, i) in seen:
+            continue
+        items.append({
+            "status": "warn",
+            "message": f"报告缺少方向「{d.get('name') or d.get('en') or _direction_key(d, i)}」"
+                       f"的小节：该方向的检索结果没有写进正文",
+        })
+    return items
 
 
 def _body(answer):
@@ -77,8 +195,13 @@ def title_matches(reference_title, paper_title, threshold=0.6):
     return difflib.SequenceMatcher(None, ref, paper).ratio() >= threshold
 
 
-def verify(answer, papers):
-    """Return a list of (status, message) lines. Status in {"ok", "warn", "bad"}."""
+def verify(answer, papers, directions=None):
+    """Return a list of (status, message) lines. Status in {"ok", "warn", "bad"}.
+
+    `directions` (survey runs only) adds the report-shape checks of
+    survey_items() to the citation checks, so a report that dropped a chosen
+    direction is flagged here -- by rules, before any model is asked.
+    """
     by_index = {i + 1: p["title"] for i, p in enumerate(papers)}
     cited = extract_citations(answer)
     references = extract_references(answer)
@@ -107,11 +230,12 @@ def verify(answer, papers):
 
     if not cited:
         lines.append(("bad", "no citations found in the answer body"))
+    lines.extend((it["status"], it["message"]) for it in survey_items(answer, directions or []))
     return lines
 
 
-def report(answer, papers):
-    lines = verify(answer, papers)
+def report(answer, papers, directions=None):
+    lines = verify(answer, papers, directions)
     if not any(status == "bad" for status, _ in lines):
         lines.insert(0, ("ok", "all citations verified against retrieved papers"))
     return ["--- Citation verification ---"] + [
@@ -145,7 +269,7 @@ def llm_check(answer, papers):
         blocks = []
         for n in batch:
             p = papers[n - 1]
-            abstract = (p["abstract"] or "")[:600]
+            abstract = (p["abstract"] or "")[:ABSTRACT_EVIDENCE_CHARS]
             blocks.append(f"[{n}] {p['title']} ({p['year']})\nAbstract: {abstract}")
         messages = [
             {"role": "system", "content": VERIFY_PROMPT},
@@ -197,7 +321,7 @@ def llm_audit(answer, papers):
         blocks = []
         for n in batch:
             p = papers[n - 1]
-            abstract = (p["abstract"] or "")[:600]
+            abstract = (p["abstract"] or "")[:ABSTRACT_EVIDENCE_CHARS]
             blocks.append(f"[{n}] {p['title']} ({p['year']})\nAbstract: {abstract}")
         messages = [
             {"role": "system", "content": VERIFY_PROMPT},
@@ -245,10 +369,10 @@ def retraction_items(answer, papers):
     return items
 
 
-def audit_rules(answer, papers):
+def audit_rules(answer, papers, directions=None):
     """Structured rule-layer audit. Returns {"lines": [...], "items":
     [{"status", "message"}]} mirroring verify()."""
-    items = [{"status": s, "message": m} for s, m in verify(answer, papers)]
+    items = [{"status": s, "message": m} for s, m in verify(answer, papers, directions)]
     items.extend(retraction_items(answer, papers))
     if not any(it["status"] == "bad" for it in items):
         items.insert(0, {"status": "ok", "message": "all citations verified against retrieved papers"})

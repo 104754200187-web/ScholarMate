@@ -927,6 +927,84 @@ def search_openalex(query, limit=20, sort=None):
     return papers
 
 
+def _doi_key(value):
+    """Normalise a DOI (`10.1234/x`), from a paper dict or a raw string."""
+    doi = value.get("doi") if isinstance(value, dict) else value
+    doi = (doi or "").strip().lower()
+    return re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
+
+
+def _oa_pdf_url(work):
+    """Best openly available PDF for one OpenAlex work, or "".
+
+    A location's `pdf_url` is a file; `open_access.oa_url` is very often only a
+    landing page -- of 273 papers OpenAlex could answer for, 189 (69%) came back
+    as a bare doi.org resolver, i.e. an address where a bot is then refused. So
+    every location is scanned for a file before any landing page is considered.
+    That is also how a paywalled article's arXiv or repository copy is found:
+    measured on the 412 records OpenAlex returned for the 416 cited papers that
+    carry no PDF URL of their own, a file was chosen for 183 of them instead of
+    152 -- 31 more papers handed the fetcher something downloadable, none
+    handed it less (e.g. 10.1145/3626772.3657834: a doi.org resolver becomes
+    arxiv.org/pdf/2401.14887). A DOI resolver is still better than nothing --
+    Springer's landing page carries `<meta name="citation_pdf_url">`, which the
+    full-text fetcher follows -- so it stays as the last resort.
+    """
+    def file_of(loc):
+        if not isinstance(loc, dict):
+            return ""
+        url = (loc.get("pdf_url") or "").strip()
+        if not url and (loc.get("url") or "").lower().endswith(".pdf"):
+            url = loc["url"].strip()
+        return url
+
+    cands = [file_of(loc) for loc in (work.get("locations") or [])]
+    cands += [file_of(work.get("best_oa_location")),
+              file_of(work.get("primary_location"))]
+    cands.append(((work.get("open_access") or {}).get("oa_url") or "").strip())
+    cands = [u for u in dict.fromkeys(cands) if u]
+    files = [u for u in cands if "doi.org/" not in u]
+    return (files or cands or [""])[0]
+
+
+def openalex_oa_pdf_urls(papers, batch=None, timeout=None):
+    """{normalised DOI: open-access PDF URL} for the given papers. Never raises.
+
+    One request per `batch` DOIs (OpenAlex takes 50 per filter). Two callers
+    need this: the per-sentence stage, because papers that arrive with no PDF
+    URL of their own are otherwise never even attempted (on the ten saved
+    surveys: 84 of 243 cited papers, 35%) and a publisher answering 403 to a
+    bot is the most common full-text failure on this host (50 of 102 skip
+    markers); and pdfpack, for the same URLs when it packs a run's PDFs. Only
+    DOIs are resolvable this way, so papers without one are simply absent from
+    the result and keep their original candidate URLs.
+    """
+    keys = [k for k in dict.fromkeys(_doi_key(p) for p in papers) if k]
+    out = {}
+    batch = batch or int(os.environ.get("OPENALEX_OA_BATCH", "50"))
+    timeout = timeout or int(os.environ.get("OPENALEX_OA_TIMEOUT", "15"))
+    for i in range(0, len(keys), batch):
+        chunk = keys[i:i + batch]
+        params = {
+            "filter": "doi:" + "|".join(chunk),
+            "per-page": len(chunk),
+            # `locations` is where a repository or arXiv copy shows up when
+            # the two headline locations only offer a landing page
+            "select": "doi,best_oa_location,primary_location,open_access,locations",
+        }
+        openalex_auth(params)
+        try:
+            data = _http_get_json(OPENALEX_SEARCH_URL, params,
+                                  timeout=timeout, retries=2)
+        except Exception:
+            continue        # an OA lookup is a bonus, not a requirement
+        for work in data.get("results") or []:
+            doi, url = _doi_key(work), _oa_pdf_url(work)
+            if doi and url:
+                out.setdefault(doi, url)
+    return out
+
+
 def search_google_scholar(query, limit=20):
     """Query Google Scholar through SerpAPI, the de-facto third-party API.
 

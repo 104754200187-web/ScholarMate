@@ -41,10 +41,9 @@ MAX_ATTEMPTS = int(os.environ.get("PDFPACK_MAX_ATTEMPTS", "3"))
 # Publishers answer 403 to a bot long before a human, so the URL a search result
 # carries is often not the downloadable copy. OpenAlex ships Unpaywall's
 # best open-access location per DOI, and one batch request resolves 50 papers at
-# once -- cheap enough to always try before admitting defeat.
-OPENALEX_WORKS_URL = "https://api.openalex.org/works"
-OA_BATCH = int(os.environ.get("PDFPACK_OA_BATCH", "50"))
-OA_TIMEOUT = int(os.environ.get("PDFPACK_OA_TIMEOUT", "15"))
+# once -- cheap enough to always try before admitting defeat. That lookup lives
+# in search.openalex_oa_pdf_urls (shared with the per-sentence stage) and reads
+# OPENALEX_OA_BATCH / OPENALEX_OA_TIMEOUT.
 
 # Windows/Word refuse these in a filename, and a leading/trailing dot or space
 # is legal in Python but not on Windows either
@@ -74,62 +73,10 @@ def _arxiv_from_doi(paper):
     return "https://arxiv.org/pdf/" + m.group(1) if m else ""
 
 
-def _doi_key(paper):
-    doi = (paper.get("doi") or "").strip().lower()
-    return re.sub(r"^https?://(dx\.)?doi\.org/", "", doi)
-
-
-def _oa_pdf_url(work):
-    """Best openly available PDF for one OpenAlex work, or ""."""
-    for loc in (work.get("best_oa_location"),
-                (work.get("primary_location") or {})):
-        if not loc:
-            continue
-        url = (loc.get("pdf_url") or "").strip()
-        if not url and (loc.get("url") or "").lower().endswith(".pdf"):
-            url = loc["url"].strip()
-        if url:
-            return url
-    return ((work.get("open_access") or {}).get("oa_url") or "").strip()
-
-
-def resolve_oa_urls(papers):
-    """{doi_key: pdf_url} from OpenAlex, in batched requests. Never raises.
-
-    Only DOIs are resolvable this way, so papers without one are simply absent
-    from the result -- they keep their original candidate URLs.
-    """
-    keys = [k for k in dict.fromkeys(_doi_key(p) for p in papers) if k]
-    out = {}
-    for i in range(0, len(keys), OA_BATCH):
-        chunk = keys[i:i + OA_BATCH]
-        params = {
-            "filter": "doi:" + "|".join(chunk),
-            "per-page": len(chunk),
-            "select": "doi,best_oa_location,primary_location,open_access",
-        }
-        search.openalex_auth(params)
-        try:
-            data = search.http_get_json(OPENALEX_WORKS_URL, params,
-                                        timeout=OA_TIMEOUT, retries=2)
-        except Exception:
-            continue        # OA lookup is a bonus, not a requirement
-        for work in data.get("results") or []:
-            doi = re.sub(r"^https?://(dx\.)?doi\.org/", "",
-                         (work.get("doi") or "").strip().lower())
-            url = _oa_pdf_url(work)
-            if doi and url:
-                out.setdefault(doi, url)
-    return out
-
-
-_CITATION_PDF = re.compile(
-    rb"""<meta[^>]+name=["']citation_pdf_url["'][^>]*?content=["']([^"']+)["']""",
-    re.I)
-_CITATION_PDF_REV = re.compile(
-    rb"""<meta[^>]+content=["']([^"']+)["'][^>]*?name=["']citation_pdf_url["']""",
-    re.I)
-_HTML_PDF_LINK = re.compile(rb"""href=["']([^"'\s]+\.pdf[^"'\s]*)["']""", re.I)
+# DOI normalisation, the landing-page link reader and the "is this a PDF?" test
+# live in fulltext.py, which needs all three for every full-text download; the
+# OpenAlex open-access lookup lives in search.py (it owns the API client).
+_doi_key = fulltext.doi_key
 
 
 def _fetch(url):
@@ -137,34 +84,6 @@ def _fetch(url):
     fulltext._arxiv_wait(url)
     return fulltext._http_get(url, timeout=TIMEOUT, retries=1,
                               max_bytes=MAX_FILE_BYTES)
-
-
-def _pdf_from_html(data, base=""):
-    """Publishers advertise the real PDF on the landing page they show a bot.
-
-    OUP / SAGE / Wiley / MDPI all ship `<meta name="citation_pdf_url">`, which
-    is both the cheapest and the most reliable thing to look for. Returns an
-    absolute URL or "".
-    """
-    head = data[:200_000]
-    m = _CITATION_PDF.search(head) or _CITATION_PDF_REV.search(head)
-    if not m:
-        m = _HTML_PDF_LINK.search(head)
-    if not m:
-        return ""
-    url = m.group(1).decode("utf-8", "ignore").strip()
-    url = url.replace("&amp;", "&")
-    if url.startswith("//"):
-        return "https:" + url
-    if url.startswith("/") and base:
-        m2 = re.match(r"(https?://[^/]+)", base)
-        if m2:
-            return m2.group(1) + url
-    return url if url.startswith("http") else ""
-
-
-def _is_pdf(data):
-    return data[:5].startswith(b"%PDF") or b"%PDF" in data[:1024]
 
 
 def download_papers(papers, should_cancel=None, oa=None):
@@ -221,11 +140,11 @@ def download_papers(papers, should_cancel=None, oa=None):
             except Exception as e:
                 failures.append(f"{via}下载失败：{e}")
                 continue
-            if _is_pdf(data):
+            if fulltext.looks_like_pdf(data):
                 return {"index": idx, "paper": paper, "ok": True, "data": data,
                         "url": url, "via": via, "attempted": True}
             # a landing page: the PDF it advertises gets tried first
-            inner = _pdf_from_html(data, url)
+            inner = fulltext.pdf_link_from_html(data, url)
             if inner and inner not in seen:
                 queue.insert(0, (inner, "落地页内的 PDF 链接"))
             failures.append(f"{via}返回的不是 PDF（可能是落地页）")
@@ -284,7 +203,7 @@ def _report(papers, results, question, run_id, packed):
 def build_zip(papers, store=None, question="", run_id=""):
     """Pack the downloadable PDFs + manifests. Returns (zip_bytes, summary)."""
     papers = list(papers)[:MAX_PAPERS]
-    oa = resolve_oa_urls(papers)
+    oa = search.openalex_oa_pdf_urls(papers)
     results = download_papers(papers, oa=oa)
     packed, total, oversized = set(), 0, []
     for r in results:

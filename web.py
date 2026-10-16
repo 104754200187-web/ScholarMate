@@ -39,6 +39,7 @@ import rerank
 import scoring
 import screening
 import search
+import sentences
 
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "history")
 os.makedirs(HISTORY_DIR, exist_ok=True)
@@ -296,21 +297,39 @@ def _count_llm(audit):
             "unsupported": sum(1 for v in verdicts if not v.get("supported"))}
 
 
-BADGE_KEYS = ("cross", "fulltext", "abstract", "unknown", "unsupported")
+BADGE_KEYS = ("cross", "fulltext", "abstract", "unknown", "unsupported", "unfetched")
+
+
+def _claim_badge(claim):
+    """The badge of one claim verdict.
+
+    A stored "unsupported" is re-derived: runs saved before this rule existed
+    called a claim unsupported even when the cited paper's text never arrived
+    (the evidence note records the failure), and an unchecked claim must not be
+    counted -- or shown -- as a negative result. The same derivation is in the
+    page's badgeFor(), which reads the same snapshots.
+    """
+    key = claim.get("badge")
+    if key in BADGE_KEYS and (key != "unsupported" or claim.get("supported")):
+        return key
+    if claim.get("supported"):
+        return key if key in BADGE_KEYS else "unknown"
+    evidence = claim.get("evidence") or []
+    if any(sentences.fetch_failed(e.get("note")) for e in evidence):
+        return "unfetched"
+    return "unsupported"
 
 
 def _count_claims(audit):
     if audit.get("skipped"):
-        return {"supported": 0, "unsupported": 0, "passages_used": 0,
+        return {"supported": 0, "unsupported": 0, "unfetched": 0, "total": 0, "passages_used": 0,
                 "evidence_snippets": 0, "evidence_fulltext": 0, "evidence_abstract": 0,
                 "badges": {}, "skipped": True}
     verdicts = audit.get("verdicts") or []
     fulltext = abstract = snippets = 0
     badges = {}
     for c in verdicts:
-        key = c.get("badge")
-        if key not in BADGE_KEYS:
-            key = "unsupported" if not c.get("supported") else "unknown"
+        key = _claim_badge(c)
         badges[key] = badges.get(key, 0) + 1
         for e in c.get("evidence") or []:
             count = len(e.get("passages") or [])
@@ -320,7 +339,9 @@ def _count_claims(audit):
                 fulltext += count
             snippets += count
     return {"supported": sum(1 for c in verdicts if c.get("supported")),
-            "unsupported": sum(1 for c in verdicts if not c.get("supported")),
+            "unsupported": badges.get("unsupported", 0),
+            "unfetched": badges.get("unfetched", 0),
+            "total": len(verdicts),
             "passages_used": audit.get("passages_used") or 0,
             "evidence_papers": sum(len(c.get("evidence") or []) for c in verdicts),
             "evidence_snippets": snippets,
@@ -922,6 +943,7 @@ PAGE = """<!DOCTYPE html>
   input[type=range] { width:160px; accent-color:var(--accent); }
   .claim.unsup { border-color:var(--bad); }
   .claim.sup { border-color:var(--good); }
+  .claim.unf { border-color:var(--warn); }
   .meta { color:var(--muted); font-size:12.5px; font-variant-numeric:tabular-nums; }
   #runhint { margin-top:6px; }
   .evidence { margin-top:6px; }
@@ -947,6 +969,7 @@ PAGE = """<!DOCTYPE html>
   .badge.abs   { color:var(--warn); border-color:rgba(245,185,66,.45); }
   .badge.unk   { color:var(--muted); }
   .badge.uns   { color:var(--bad); border-color:rgba(255,107,107,.45); }
+  .badge.nfet  { color:var(--warn); border-color:rgba(245,185,66,.45); border-style:dashed; }
   .paper { border-top:1px solid var(--line); padding:9px 0; border-radius:8px;
            transition:background .12s; }
   .paper:hover { background:var(--hover); }
@@ -2874,15 +2897,41 @@ const BADGE_META = {
   fulltext: {cls: "ft", label: "全文支持"},
   abstract: {cls: "abs", label: "仅摘要支持"},
   unknown: {cls: "unk", label: "支持（未取到原文）"},
-  unsupported: {cls: "uns", label: "不支持"}
+  unsupported: {cls: "uns", label: "不支持"},
+  unfetched: {cls: "nfet", label: "无法核对（原文未取到）"}
 };
 
+// Same list as sentences._FETCH_FAILURES: the notes fulltext.get_fulltext
+// returns when a download or an extraction did not produce text.
+const FETCH_FAILURES = ["download failed", "timed out", "text extraction failed",
+  "extraction busy", "deadline reached", "unavailable in a recent run",
+  "landing page"];
+
+function fetchFailed(note) {
+  const low = (note || "").toLowerCase();
+  return FETCH_FAILURES.some(m => low.indexOf(m) >= 0);
+}
+
 function badgeFor(cl) {
+  // A stored "unsupported" is not trusted: runs saved before the unfetched
+  // rule existed recorded a claim as unsupported even when the paper's text
+  // never arrived (the evidence note says why), so it is re-derived below.
+  if (cl.badge && BADGE_META[cl.badge] && cl.badge !== "unsupported") {
+    return {key: cl.badge, label: cl.badge_label || BADGE_META[cl.badge].label, note: cl.badge_note || ""};
+  }
+  if (!cl.supported) {
+    const failed = (cl.evidence || []).filter(e => fetchFailed(e.note));
+    if (failed.length) {
+      const why = failed.map(e => e.note).filter((v, i, a) => v && a.indexOf(v) === i).join("; ");
+      return {key: "unfetched", label: "无法核对（原文未取到）",
+              note: "本次未取到可核对原文（" + why + "），判决无从核对——不等于不支持"};
+    }
+    return {key: "unsupported", label: "不支持", note: "判决：该声明未被证据支持"};
+  }
   if (cl.badge && BADGE_META[cl.badge]) {
     return {key: cl.badge, label: cl.badge_label || BADGE_META[cl.badge].label, note: cl.badge_note || ""};
   }
   // snapshots written before badges existed: derive the same classification
-  if (!cl.supported) return {key: "unsupported", label: "不支持", note: "判决：该声明未被证据支持"};
   const sup = cl.supporting || [];
   const ev = cl.evidence || [];
   const supEv = ev.filter(e => sup.indexOf(e.n) >= 0);
@@ -3351,18 +3400,25 @@ function renderAudits(data) {
       if (c.claims.skipped) {
         chipsHtml.push('<span class="chip warn">逐句证据 已跳过（快速模式）</span>');
       } else {
-        let claimTxt = "逐句证据 " + c.claims.supported + "/" + (c.claims.supported + c.claims.unsupported) + " 支持";
+        const claimTotal = c.claims.total || (c.claims.supported + c.claims.unsupported + (c.claims.unfetched || 0));
+        let claimTxt = "逐句证据 " + c.claims.supported + "/" + claimTotal + " 支持";
         const bd = c.claims.badges || {};
         const seg = [];
         if (bd.cross) seg.push("多篇交叉 " + bd.cross);
         if (bd.fulltext) seg.push("全文 " + bd.fulltext);
         if (bd.abstract) seg.push("仅摘要 " + bd.abstract);
         if (bd.unknown) seg.push("未取到原文 " + bd.unknown);
+        if (bd.unfetched) seg.push("无法核对 " + bd.unfetched);
         if (seg.length) claimTxt += "（" + seg.join(" · ") + "）";
         if (c.claims.evidence_snippets) {
           claimTxt += " · 可核对原文 " + c.claims.evidence_snippets + " 段";
         }
-        chipsHtml.push('<span class="chip ' + (c.claims.unsupported ? "bad" : "good") + '">' + claimTxt + '</span>');
+        const claimCls = c.claims.unsupported ? "bad" : (c.claims.unfetched ? "warn" : "good");
+        const claimTip = c.claims.unfetched
+          ? esc(c.claims.unfetched + " 条声明因为没取到原文而未核对——不等于不支持")
+          : "";
+        chipsHtml.push('<span class="chip ' + claimCls + '"' + (claimTip ? ' title="' + claimTip + '"' : "") +
+          '>' + claimTxt + '</span>');
       }
       const fs = c.claims.fulltext_stats || {};
       if (fs.total) {
@@ -3475,8 +3531,10 @@ function renderAudits(data) {
     }
     for (const cl of claims) {
       const bf = badgeFor(cl);
-      html += '<div class="claim ' + (cl.supported ? "sup" : "unsup") + '">' +
-        (cl.supported ? "✅" : "❌") + " " + badgeHTML(cl) + " 声明 " + cl.id + "：<strong>" + esc(cl.text) + "</strong>" +
+      const uncovered = bf.key === "unfetched";
+      html += '<div class="claim ' + (uncovered ? "unf" : cl.supported ? "sup" : "unsup") + '">' +
+        (uncovered ? "⚠️" : cl.supported ? "✅" : "❌") + " " + badgeHTML(cl) + " 声明 " + cl.id +
+        (cl.section ? "（" + esc(cl.section) + "）" : "") + "：<strong>" + esc(cl.text) + "</strong>" +
         "<div class='meta'>" + (bf.note ? esc(bf.note) + " ｜ " : "") + "支持来源：" + esc((cl.titles || []).join("; ") || "无") +
         (cl.reason ? " ｜ 理由：" + esc(cl.reason) : "") + "</div>" +
         renderClaimEvidence(cl) + "</div>";
