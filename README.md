@@ -407,6 +407,21 @@ cp .env.example .env   # 填入你的 API key
 | `WEB_MAX_CONNECTIONS` | 可选 | Web 进程同时处理的连接数上限，默认 `128`（浏览器每标签页会占若干条，这是失控护栏而非吞吐指标；超出后新连接在监听队列排队） |
 | `WEB_CONCURRENCY` | 可选 | 同一进程内**同时执行**几个运行，默认 `1`（第二个人的任务在队列里等第一个人跑完）。设为 `2` 起两个执行线程，实测两路检索同时 `running`；注意每路都会消耗外部配额（DeepSeek / Semantic Scholar / SerpAPI），且各源的健康状态（熔断）是全进程共享的 |
 
+### 网络与代理（检索全空时先看这里）
+
+本机**直连外网不通**，所有外部请求必须走代理；`.env` 里的 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
+就是给这件事用的（`.env` 不进仓库，`.env.example` 只放注释模板）。缺了它们，六个数据源和 DeepSeek
+会**同时**失败。
+
+- 判别方法：报 `Connection refused` = 代理进程没跑或地址/端口变了；报 `timed out` = 没走代理、在直连。
+- 自检一条命令：`python3 search.py "retrieval augmented generation"`，能打印论文即链路正常；
+  或 `curl -x "$HTTPS_PROXY" 'https://api.openalex.org/works?per-page=1'` 应返回 JSON。
+- **全源失败不再伪装成空结果**：一轮里所有查询的所有数据源都报错、且没有任何论文入库时，任务以
+  `❌ 失败` 结束并在错误里带上真实原因与代理提示——此前（10/19 代理挂掉那次）它照样显示
+  `✅ 完成` + 空列表，用户无法区分「网络坏了」和「真的没有相关文献」。
+- 另注：入库会跳过**没有摘要**的命中（`add_papers_many`），所以极少数情况下「源答了、也命中了，
+  但池子仍是空的」是正常的——这与全源失败是两回事，前者不会报错。
+
 ## 五、使用
 
 ```bash
@@ -521,6 +536,7 @@ python3 eval.py --mode snapshot --snapshots outputs/history   # 快照质量汇�
 - [x] PDF 体积上限与抽取超时护栏
 - [x] 逐句补证检索快源化 + 连接级失败不重试（`verify_sentences` 实测 112.7s → 约 45s，产出不降）
 - [x] 连接级失败不重试 + 数据源熔断递增冷却 + 不可用 PDF 落盘跳过
+- [x] 检索可观测性：代理写入 `.env`（避免换一种启动方式就全源失败）；一轮内所有数据源都报错且 0 篇入库时以 `❌ 失败` 结束并给出原因，不再显示 `✅ 完成` + 空列表
 - [x] **全文取证路径增强**：每条被引论文最多两条下载地址（检索结果自带 `pdf_url` + OpenAlex 开放获取副本 `openalex_oa_pdf_urls`，每 50 个 DOI 一次批量请求，补上「十份快照里 35% 的被引论文根本没有 PDF URL、连一次尝试都没有」这个洞）；拿到落地页时读它自己的 `<meta name="citation_pdf_url">` 再下一跳取真 PDF；兜底地址扫描 OpenAlex 的 `locations` 全表并**优先取真正的文件**（实测 +31 篇拿到可下载文件、0 篇变差）；跳过标记改为**按 URL** 记（`{cache_key: {地址: 原因}}`，旧的扁平格式在载入时自动迁移），修掉「第二个地址的失败覆盖第一个标记、导致付费墙地址每隔一轮重付 20s+」的问题
 - [x] OpenAlex API key 支持（`OPENALEX_API_KEY`）：解掉「search cluster under elevated load」的集群限流 429（该 429 用 mailto 解不掉），实测单源 `hits 0 / 429 → 40 hits / 0 err`
 - [x] 撤稿筛查在仅检索模式做成开关（该模式墙钟 −29%）

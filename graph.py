@@ -695,6 +695,22 @@ def node_retrieve(state):
         queries_log += classic_log
         print(f"      [classic] {classic_added} landmark paper(s) added "
               f"(>= {search.CLASSIC_MIN_CITATIONS} citations, else the top hit per query)")
+    if added + classic_added == 0:
+        # A run where every source errored is not "no papers match": on
+        # 2026-10-19 the machine's outbound proxy was down, all six sources
+        # answered "Connection refused", and the job still ended "✅ 完成"
+        # with an empty list -- the user had no way to tell a dead network
+        # from an empty literature. Only an answer from *some* source can
+        # honestly produce "no results", so raise and let the job fail with
+        # the reason.
+        errors = [q.get("error") for q in queries_log if q.get("error")]
+        if errors and all(q.get("error") for q in queries_log):
+            raise RuntimeError(
+                "所有检索数据源都请求失败（这不是「没有相关文献」）："
+                + errors[0][:400]
+                + "\n  提示：先确认本机能访问外网（直连通常不通，需要代理），"
+                  "再检查 .env 里的 HTTP_PROXY / HTTPS_PROXY 是否可用。"
+            )
     tier = journal.current_filter()
     if tier is not None and tier.enabled:
         summary = tier.summary()
