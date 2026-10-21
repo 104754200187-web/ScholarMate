@@ -109,6 +109,18 @@ def _title_key(title):
 
 _REQUEST_OPTS = threading.local()
 
+
+def _set_request_opts(spec):
+    """Apply one source's timeout/retries to this worker thread.
+
+    Set both values explicitly (including None): otherwise a thread that ran a
+    different source earlier would keep that source's settings through the
+    thread-local, and an explicit single-source call would silently inherit
+    them.
+    """
+    _REQUEST_OPTS.timeout = (spec or {}).get("timeout")
+    _REQUEST_OPTS.retries = (spec or {}).get("retries")
+
 # A 429 that comes with a long Retry-After is not a hiccup, it is a ban: back
 # off for as long as the server asks (capped) instead of burning the retry
 # budget in every round of every run.
@@ -447,15 +459,16 @@ def _run_source(spec, query, limit, filters, sort=None):
     name = spec["name"]
     if _breaker_open(name):
         return {"source": name, "hits": [], "error": None, "skipped": True,
-                "note": "近期失败，已临时跳过", "seconds": 0.0}
+                "skip_reason": "breaker", "note": "近期失败，已临时跳过",
+                "seconds": 0.0}
     if sort and not spec.get("supports_sort"):
         return {"source": name, "hits": [], "error": None, "skipped": True,
+                "skip_reason": "sort_unsupported",
                 "note": "该源不支持按被引量排序", "seconds": 0.0}
     t0 = time.monotonic()
     try:
         with _THROTTLES[name].slot():
-            _REQUEST_OPTS.timeout = spec.get("timeout")
-            _REQUEST_OPTS.retries = spec.get("retries")
+            _set_request_opts(spec)
             hits = _call_source(spec, query, limit, sort=sort, filters=filters)
         _clear_breaker(name)
         return {"source": name, "hits": hits, "error": None,
@@ -810,6 +823,7 @@ def search_many_detailed(queries, limit=5, source="auto", filters=None, sort=Non
             t0 = time.monotonic()
             item = {"query": q, "papers": [], "sources": [], "error": None}
             try:
+                _set_request_opts(spec)
                 papers = _call_source(spec, q, limit, sort=sort, filters=filters)
                 item["papers"] = papers
                 item["sources"].append({
@@ -831,7 +845,8 @@ def search_many_detailed(queries, limit=5, source="auto", filters=None, sort=Non
             "sources": [
                 {"source": r["source"], "hits": len(r["hits"]),
                  "seconds": r["seconds"], "error": r["error"],
-                 "skipped": bool(r.get("skipped")), "note": r.get("note")}
+                 "skipped": bool(r.get("skipped")),
+                 "skip_reason": r.get("skip_reason"), "note": r.get("note")}
                 for r in slot["results"]
             ],
             "error": "; ".join(slot["errors"]) or None,

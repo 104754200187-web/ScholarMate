@@ -182,6 +182,11 @@ def _decision_counts(papers, store):
 
 def _csv_cell(value):
     text = re.sub(r"[\r\n]+", " ", str(value if value is not None else "")).strip()
+    # Excel treats a leading =, +, - or @ as a formula. A numeric cell (year,
+    # citation count, a negative delta) must stay numeric, so only string
+    # values are prefixed with an apostrophe.
+    if not isinstance(value, (int, float)) and text[:1] in ("=", "+", "-", "@", "\t"):
+        text = "'" + text
     return '"' + text.replace('"', '""') + '"' if any(c in text for c in ',"') else text
 
 

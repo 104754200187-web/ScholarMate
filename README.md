@@ -237,7 +237,7 @@ python3 -c "import graph; print(graph.get_app().get_graph().draw_mermaid())"
 **证据评分（10 维度加权，权重由用户决定；仅智能问答模式）**
 - **只在智能问答模式执行**：它服务于「判断答案背后的证据可不可靠」，而「仅搜索论文」定位是快速、纯粹的检索清单，因此不附加任何评分开销（前端在切换模式时会隐藏评分选项，后端也会忽略 search 模式传来的评分请求）。
 - 单一“相关性”分数表达不了证据能不能用：机制类结论与临床结论需要的支撑不同。所以每篇论文在 **10 个维度**上独立打 0-100 分，再按**用户设定的权重**合成总分与等级。
-- 维度与默认权重：相关性 5、直接性 4、方法可靠性 5、重复验证 4、结构支持 1、数据完整性 4、物种匹配 3、影响力 2、偏倚风险 4、矛盾证据 4。UI 上是 10 个滑杆（0-5），**拖到 0 即忽略该维度**；另有 5 套预设：均衡 / 机制·结构优先 / 实验验证优先 / 临床·转化 / 快速初筛。权重与目标物种自动保存（`outputs/scoring_weights.json`），下次提问直接生效。
+- 维度与默认权重：相关性 5、直接性 4、方法可靠性 5、重复验证 4、结构支持 1、数据完整性 4、物种匹配 3、影响力 2、偏倚风险 4、矛盾证据 4。UI 上是 10 个滑杆（0-5），**拖到 0 即忽略该维度**；另有 5 套预设：均衡 / 机制·结构优先 / 实验验证优先 / 临床·转化 / 快速初筛。权重与目标物种自动保存；Web 端按匿名 owner 写入 `outputs/scoring-<owner>.json`，不同浏览器互不覆盖，CLI 仍使用全局 `outputs/scoring_weights.json`，下次提问直接生效。
 - **风险维度反向计入**：偏倚风险与矛盾证据按 `100 − 得分` 参与合成，因此**总分始终是「越高越好」**，把「偏倚风险」权重调高只会更严格，不会让烂论文得分更高。
 - **9 个维度由 DeepSeek 判**（相关性、直接性、方法可靠性、重复验证、结构支持、数据完整性、物种匹配、偏倚风险、矛盾证据），每篇输出 10 个分数 + 一句中文评分说明；**影响力在本地计算**（引用速度 `cites/年` 取对数 + 发表载体，不写死任何期刊排名），因此不花模型调用也不会随运行漂移。
 - **物种匹配**需要用户填「目标物种」（如 `human` / `mouse`）：留空时该维度权重自动置 0，不会拿未知物种去硬打分；填了则按是否符合目标物种给分。
@@ -275,6 +275,7 @@ python3 -c "import graph; print(graph.get_app().get_graph().draw_mermaid())"
 
 **性能与快速模式**
 - 全文下载**并发预取**：判决前先并行抓取被引论文的全文（`fulltext.prefetch_fulltexts`），把 N 次串行下载压成约 N/4 轮；arXiv 请求跨线程仍保持 3s 礼貌间隔。
+- **全文预算按声明分配**：不再按参考文献顺序把每篇被引论文都排进下载队列。`sentences.plan_fulltext_budget()` 先按「独家引用 / 无可读摘要 / 池内是否有独立论文覆盖」给声明排序，第一轮在名额与可下载地址允许时优先给每个声明选一篇，剩余名额再按累计风险暴露与覆盖声明数补给高价值论文；未入选论文只读摘要，后续证据收集也不会偷偷串行重下。页面 chip 显示「预算 已选/可下载」，快照 `fulltext_stats.budget` 记录 `considered / fetchable / selected / deferred / no_address`。
 - 单请求超时从 `60s × 3 次` 收紧到 `25s × 2 次`，并支持整段墙钟上限 `FULLTEXT_DEADLINE_S`（默认 300s），到点后剩余检索自动回退摘要、不再阻塞回答。
 - **快速模式**：关闭「逐句全文校验」后跳过声明拆分/证据检索/判决，仅保留规则层与 LLM 归因层，回答秒级返回（实测同一问题的完整模式 174s → 快速模式 34.3s）。
 - **撤稿筛查在「仅检索论文」模式变成开关**：写综述时它必须有（不能拿撤稿论文当证据），但检索列表不需要为此等 13s——统计 11 次 search 运行，它平均占总墙钟 **29%**。默认跳过，界面勾选即开启，`RETRACTION_IN_SEARCH=1` 可恢复成每次必跑。
@@ -289,7 +290,7 @@ python3 -c "import graph; print(graph.get_app().get_graph().draw_mermaid())"
 - **不可用 PDF 落盘跳过，且按地址记**：403 付费墙与「抽取超时」的论文记入 `fulltext_cache/_skips.json`（付费墙 7 天、网络类 6 小时），同一篇不再每轮重付 20s+。跳过标记**按 URL 区分**（`{cache_key: {地址: 原因}}`，旧格式读入时自动迁移）：出版商对检索结果自带的链接回 403，不代表 OpenAlex 给出的开放获取副本也拿不到，所以只跳过失败过的那个地址，另一条照试。早期「一篇论文只留一条标记」的写法会让第二个失败覆盖第一个，于是那个昂贵的付费墙地址每隔一轮就要重付一次 20s+。
 - **PDF 抽取上限 45s → 20s**：实测可用 PDF 抽取约 1s，慢的都是图重文件（0.85MB 需 40s、8MB 需 102s），收紧上限可避免它们拖死整段全文检索。
 - **每条被引论文最多两条下载地址 + 落地页解析**：候选 = 检索结果自带的 `pdf_url` → OpenAlex 给出的开放获取副本（`openalex_oa_pdf_urls`，每 50 个 DOI 一次批量请求）。少了后者，**十份存盘综述里 243 篇被引论文有 84 篇（35%）连一次下载尝试都不会有**——它们本来就没有 `pdf_url`。取这条兜底地址时把 `locations` 全表扫一遍、**优先挑真正的文件**而不是落地页：实测 416 篇「自己没有 PDF URL」的论文里，OpenAlex 回了 412 条记录，按 `bf/primary` 两点取只得到 152 个文件地址、121 个 doi.org 落地页；扫描全部 location 后文件地址升到 183、落地页降到 90——**+31 篇从「只能拿落地页」变成「能直接下文件」，且没有任何一篇变差**（付费论文的 arXiv/机构库副本就是这么找到的，例如 `10.1145/3626772.3657834` 的 doi.org 变成 `arxiv.org/pdf/2401.14887`）。取回的内容先判是不是 PDF：出版商给机器人返回的多是落地页，这时再读它自己声明的 `<meta name="citation_pdf_url">`（OUP / SAGE / Wiley / MDPI 都这么写）下一跳取真正的 PDF；`html_resolved` / `oa_fallbacks` 两个计数记在 `fulltext_stats` 里，可看出这两条新路径各自救回多少篇。
-- **PDF 护栏**：下载体积上限 `FULLTEXT_MAX_BYTES`、单篇抽取超时 `FULLTEXT_EXTRACT_TIMEOUT`（纯 Python 抽取无法中断，用守护线程 + 槽位信号量兜住），避免一篇“大而少字”的扫描版 PDF 拖死整轮（曾出现单篇抽取 ~9 分钟）。
+- **PDF 护栏**：下载体积上限 `FULLTEXT_MAX_BYTES`、单篇抽取超时 `FULLTEXT_EXTRACT_TIMEOUT`（纯 Python 抽取无法中断，用守护线程 + 槽位信号量兜住），以及 FlateDecode 解压后字节上限 `FULLTEXT_MAX_INFLATE_BYTES`；避免一篇“大而少字”的扫描版 PDF 拖死整轮（曾出现单篇抽取 ~9 分钟），也避免一条小压缩流解出巨量内容。全文内存缓存与 OpenAlex 地址映射同样有界：`FULLTEXT_MEMO_MAX_ENTRIES` / `FULLTEXT_MEMO_MAX_CHARS` / `FULLTEXT_OA_URL_MAX_ENTRIES`。
 - **阶段耗时可见**：每个节点都会打印 `[time] <node>: Xs` 并存进快照 `timings`，页面「检索统计」展开可见「⏱ 阶段耗时」，便于持续定位瓶颈。
 - **经典锚点检索的代价**：只在首轮多跑 2 条检索词 × 2 个支持排序的源（S2 bulk + OpenAlex），实测 search 模式整轮 44.1s（`retrieve` 11.2s，含经典锚点；86 篇论文、88 条溯源）——比多一次“重新检索”便宜得多，且失败不影响主检索。
 
@@ -375,6 +376,11 @@ cp .env.example .env   # 填入你的 API key
 | `FULLTEXT_MAX_BYTES` | 可选 | 单个 PDF 体积上限，默认 `8000000`（超过直接跳过，防抽取被拖死） |
 | `FULLTEXT_EXTRACT_TIMEOUT` | 可选 | 单篇 PDF 文本抽取墙钟上限，默认 `20` 秒（实测 0.9MB 图重 PDF 需 40s+、8MB 需 102s，超过上限即回退摘要） |
 | `FULLTEXT_EXTRACT_CONCURRENCY` | 可选 | 同时进行的抽取数，默认 `2` |
+| `FULLTEXT_MAX_INFLATE_BYTES` | 可选 | 单条 FlateDecode 流解压后的字节上限，默认 `33554432`（32MB）；超过则丢弃该流，防解压炸弹 |
+| `FULLTEXT_MEMO_MAX_ENTRIES` | 可选 | 全文内存缓存最多保留多少条，默认 `128`；超出按最久未使用淘汰 |
+| `FULLTEXT_MEMO_MAX_CHARS` | 可选 | 全文内存缓存总字符上限，默认 `33554432`（32MB）；与条数上限同时生效 |
+| `FULLTEXT_OA_URL_MAX_ENTRIES` | 可选 | DOI → OpenAlex 开放获取地址映射的上限，默认 `20000` |
+| `FULLTEXT_SKIP_MAX_ENTRIES` | 可选 | 落盘跳过标记最多保留多少篇，默认 `5000`；载入时清理过期标记并保留最新条目 |
 | `SEARCH_WORKERS` | 可选 | 检索并行度（查询 × 数据源），默认 `6` |
 | `LANGGRAPH_CHECKPOINT` | 可选 | 是否启用 LangGraph checkpointer（断点续跑），默认 `1` |
 | `LANGGRAPH_MAX_THREADS` | 可选 | 内存中保留多少个运行断点，默认 `8`（成功运行会立刻释放自己的断点） |
@@ -390,6 +396,7 @@ cp .env.example .env   # 填入你的 API key
 | `CLAIM_EVIDENCE_WORKERS` | 可选 | 逐句证据取证并行度，默认 `4` |
 | `CLAIM_JUDGE_WORKERS` | 可选 | 逐句判决批次并行度，默认 `3` |
 | `CLAIM_EVIDENCE_QUERY_BUDGET` | 可选 | 逐句补证检索的查询数上限，默认 `8`（声明上限已是 24，因此超过 8 条的声明会被裁掉查询——裁的是**论文池里已经覆盖得最好**的那几条；查询并发执行，调大只多几十秒网络等待。要每条声明都单独搜一遍就设 `24`） |
+| `CLAIM_FULLTEXT_BUDGET` | 可选 | 逐句全文阶段最多选多少篇被引论文下载全文，默认 `auto`：`min(24, max(8, 声明数 + 4))`（每个声明先保底一篇，再补 4 篇高价值论文）。正整数为硬上限；`0` 不下载全文；`-1` 恢复旧行为（所有有地址的被引论文都试）。未选中的论文仍用摘要参与判决 |
 | `CLAIM_EVIDENCE_SOURCES` | 可选 | 逐句补证检索使用哪些源，默认 `openalex,semantic_scholar,europe_pmc,crossref`（四个免 key 快源；要更强覆盖可加回 `google_scholar`，会消耗配额） |
 | `OPENALEX_OA_BATCH` | 可选 | 查开放获取副本时每个请求打包的 DOI 数，默认 `50`（OpenAlex filter 上限） |
 | `OPENALEX_OA_TIMEOUT` | 可选 | 上述批量请求的超时秒数，默认 `15`（失败仅跳过，不影响主流程） |
@@ -403,9 +410,15 @@ cp .env.example .env   # 填入你的 API key
 | `PDFPACK_MAX_TOTAL_BYTES` | 可选 | 单个 ZIP 合计体积上限，默认 `150000000` |
 | `PDFPACK_TIMEOUT` | 可选 | 单个 PDF 下载超时秒数，默认 `25` |
 | `JOBSTORE_DB` | 可选 | 任务表数据库文件路径，默认 `outputs/jobs.db` |
+| `JOBSTORE_STALE_S` | 可选 | 其他实例的 running 任务心跳超过多少秒才算失联，默认 `300`；同机任务优先用 PID 存活判断 |
 | `PROGRESS_FLUSH_S` | 可选 | 运行中把阶段/日志写回任务表的最小间隔秒数，默认 `2`（`/status` 读的是内存里的实时副本，不受此影响） |
 | `WEB_MAX_CONNECTIONS` | 可选 | Web 进程同时处理的连接数上限，默认 `128`（浏览器每标签页会占若干条，这是失控护栏而非吞吐指标；超出后新连接在监听队列排队） |
 | `WEB_CONCURRENCY` | 可选 | 同一进程内**同时执行**几个运行，默认 `1`（第二个人的任务在队列里等第一个人跑完）。设为 `2` 起两个执行线程，实测两路检索同时 `running`；注意每路都会消耗外部配额（DeepSeek / Semantic Scholar / SerpAPI），且各源的健康状态（熔断）是全进程共享的 |
+| `WEB_GRAPH_RATE_WINDOW` | 可选 | `/citegraph`、`/poolgraph`、`/paperinfo` 的滑动窗口秒数，默认 `60` |
+| `WEB_GRAPH_RATE_MAX` | 可选 | 每个 owner + 端点在上面的窗口内最多请求几次，默认 `10`；超出返回 429 + `Retry-After` |
+| `WEB_GRAPH_CONCURRENCY` | 可选 | 进程内同时构建图谱的上限，默认 `3`；占满时返回 503 + `Retry-After` |
+
+**多实例边界**：任务表会把 `worker`（`host:pid`）与心跳写进 SQLite，启动恢复只结算无主旧行、同机已退出进程、或其他主机心跳超时的任务，不会再把另一个实例正在跑的任务标成中断。但身份仍是匿名 owner，检索熔断与跨用户检索缓存仍是**单进程内存状态**；多实例部署尚未完成，不能把这些状态当成跨实例共享。
 
 ### 网络与代理（检索全空时先看这里）
 
@@ -474,6 +487,8 @@ Web 使用要点：
 ```bash
 python3 eval.py --data eval_data/gold.jsonl          # 检索 Recall@20 vs 金标准
 python3 eval.py --mode snapshot --snapshots outputs/history   # 快照质量汇总
+python3 -m unittest discover -s tests -v                       # stdlib 单元测试
+python3 -m tests.run_offline                                   # 21 个离线套件
 ```
 
 ## 六、模块结构
@@ -550,7 +565,7 @@ python3 eval.py --mode snapshot --snapshots outputs/history   # 快照质量汇�
 - [x] **历史记录按用户隔离（匿名 owner）**：每个浏览器一份 `sm_owner` cookie，运行/历史/导出/追问/停止/筛选留痕全部按 owner 校验（同链接不同人互不可见，猜 id 得到 404）；升级前的无主记录默认隐藏，可由页面提示条一键接管（`POST /owner`）
 - [x] **多用户（阶段 1）· 并发执行**：同一进程可开多个执行线程（`WEB_CONCURRENCY`，生产设 `2`），`claim_next()` 保证一个任务只被认领一次。为此把原先「一次只跑一个运行」假设下的**进程级状态**改成按运行存放：进度/耗时回调（`graph.install_hooks()`，键为 run key）、逐句阶段的取消钩子与全文阶段截止时间（`contextvars`，并在每个线程池提交处传 `copy_context()`，这样池内线程也看得到）、以及运行日志的输出路由（`web._StdoutRouter`：`contextlib.redirect_stdout` 会换掉进程级 `sys.stdout`，两路同时跑会把两路的日志混给后安装的那个任务）。实测：两路检索同时 `running`、日志各自归属、停一路另一路继续跑完
 - [ ] 多用户（阶段 1）：给每用户限额（单用户同时运行数、每日运行数）
-- [ ] 逐句全文阶段仍是耗时大头：取到全文的那几份快照实测 305–438s（`FULLTEXT_DEADLINE_S=300` 到点就回退摘要）。下一步按「声明重要性 / 是否已有池内支持」分配下载预算，而不是按被引顺序排
+- [x] 逐句全文阶段按「声明重要性 / 池内覆盖」分配下载预算，而不是按被引顺序排：在名额与可下载地址允许时，每个声明先拿到一篇可下载论文（独家引用、无可读摘要、池内无独立覆盖者优先），剩余名额按累计风险暴露与覆盖声明数补给高价值论文；未入选论文只用摘要，证据收集阶段不再二次串行下载。`CLAIM_FULLTEXT_BUDGET=auto` 默认 `min(24, max(8, 声明数 + 4))`，页面与快照都能看到预算/入选/延后数量
 - [ ] 规则层方向→论文映射：现在只能查「小节有没有引用 / 方向是否漏写」，查不了「这条引用是否来自该方向的检索结果」——需要在检索时给论文打上来源方向的标记
 - [ ] 多用户（阶段 1）：跨用户共享检索结果缓存（同一查询短期内复用，多用户下最省外部配额）
 - [ ] 多用户（阶段 2）：身份认证（登录账号，把匿名 owner 升级为真实身份；历史隔离已先行，复用同一个 owner 校验口）+ 多实例部署

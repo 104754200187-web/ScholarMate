@@ -33,6 +33,14 @@ MAX_CLAIMS = 8              # a sectionless answer (ask mode) keeps the old cap
 MAX_CLAIMS_PER_SECTION = 4
 MAX_CLAIMS_TOTAL = 24
 SPLIT_WORKERS = int(os.environ.get("CLAIM_SPLIT_WORKERS", "4"))
+# How many cited papers may be fetched for full-text evidence in one run.
+# "auto" keeps one first source per claim plus four upgrades, bounded to 24;
+# a positive integer is an explicit cap; 0 fetches none and -1 fetches every
+# cited paper with an address (the pre-budget behaviour). Without this cap the
+# prefetch queue is the citation order, so a slow 403 on paper [1] can consume
+# the whole FULLTEXT_DEADLINE_S before a claim whose only support is [17] gets
+# a turn.
+FULLTEXT_BUDGET = os.environ.get("CLAIM_FULLTEXT_BUDGET", "auto").strip().lower()
 # full-text reasons that mean "we tried and did not get the text", as opposed to
 # "this paper has no open full text at all" (see fulltext.get_fulltext)
 _FETCH_FAILURES = ("download failed", "timed out", "text extraction failed",
@@ -280,21 +288,139 @@ def _query_from_claim(text):
     return query[:120]
 
 
-def _pool_support(claim_text, pool):
+def _pool_support(claim_text, pool, exclude=None):
     """Best BM25 score of any pooled paper against one claim.
 
-    Used to *order* the evidence queue: when the budget forces a cut, the
-    claims the pool already covers best are the ones to drop. It is deliberately
-    not a skip gate -- measured, dropping covered claims saved a few seconds and
-    lost ~40 papers, because a claim's own paper is not the only relevant one.
+    Used to *order* the evidence-query and full-text queues: when a budget
+    forces a cut, the claims the pool already covers best are the ones to drop.
+    It is deliberately not a skip gate -- measured, dropping covered claims
+    saved a few seconds and lost ~40 papers, because a claim's own paper is not
+    the only relevant one.
+
+    ``exclude`` drops titles already named by the claim. For the full-text
+    budget this matters: the cited paper itself is normally in the retrieval
+    pool, and counting it as independent coverage would mark every claim as
+    well covered and defer the full text that is the only evidence it has.
     """
-    papers = [p for p in (pool or {}).values() if p.get("title")]
+    skip = {verify.normalize(t) for t in (exclude or set()) if t}
+    papers = [p for p in (pool or {}).values()
+              if p.get("title") and verify.normalize(p["title"]) not in skip]
     if not papers:
         return 0.0
     docs = [fulltext.tokens((p.get("title") or "") + " " + (p.get("abstract") or ""))
             for p in papers]
     scores = fulltext.bm25_scores(claim_text, docs)
     return max(scores) if scores else 0.0
+
+
+def _fulltext_budget_limit(claim_count, fetchable_count):
+    """Resolve CLAIM_FULLTEXT_BUDGET against the papers that can be fetched."""
+    raw = str(FULLTEXT_BUDGET).strip().lower()
+    if raw in ("", "auto"):
+        limit = min(24, max(8, claim_count + 4))
+    else:
+        try:
+            limit = int(raw)
+        except ValueError:
+            limit = min(24, max(8, claim_count + 4))
+        if limit < 0:
+            limit = fetchable_count
+    return min(fetchable_count, max(0, limit))
+
+
+def _fetchable(paper):
+    return bool(fulltext.pdf_url_for(paper) or fulltext.alternative_pdf_url(paper))
+
+
+def plan_fulltext_budget(claims, papers, pool=None):
+    """Choose which cited papers get a full-text download attempt.
+
+    The old prefetch queued every cited paper in bibliography order. With four
+    workers and a wall-clock deadline that is effectively a lottery: a slow
+    publisher at [1] can consume the budget before [17] -- the only source for
+    a later claim -- starts. Here the unit of value is a claim, not a paper:
+
+    * A claim whose cited paper is also in the pool only through another copy
+      of that same paper has no independent support. It ranks high.
+    * A sole citation, or a claim whose cited papers have no abstract, is more
+      exposed: without full text the judgment has nothing to read.
+    * "Pool coverage" is BM25 of titles/abstracts of *other* papers. It is an
+      ordering factor here, never a skip gate.
+
+    The first pass tries to give each claim one fetchable paper, in claim-risk
+    order (when a fetchable citation exists and a slot remains). The second
+    pass spends the remaining slots on papers with the highest cumulative
+    exposure (then the most claims). Returns deterministic selection metadata;
+    the selected papers are the only ones the evidence collector may fetch, so
+    deferred papers fall back to their abstracts instead of re-downloading
+    serially later.
+    """
+    rows, records = [], {}
+    for c in claims or []:
+        ns = list(dict.fromkeys(_cited_for(c, papers)))
+        if not ns:
+            continue
+        titles = [papers[n - 1].get("title") or "" for n in ns]
+        support = _pool_support(c["text"], pool, exclude=titles)
+        has_abstract = any((papers[n - 1].get("abstract") or "").strip() for n in ns)
+        sole = len(ns) == 1
+        # A sole citation and an unreadable abstract each add one point; an
+        # independent pool match removes up to two more. This keeps coverage a
+        # real factor instead of a tie-breaker only.
+        risk = ((1.0 if sole else 0.0)
+                + (1.0 if not has_abstract else 0.0)
+                + 2.0 / (1.0 + support))
+        rows.append({"risk": risk, "support": support, "cid": c["id"], "ns": ns})
+        for n in ns:
+            rec = records.setdefault(n, {"claims": set(), "sole": 0,
+                                         "no_abstract": 0, "coverage": 0.0,
+                                         "exposure": 0.0})
+            rec["claims"].add(c["id"])
+            rec["sole"] += 1 if sole else 0
+            rec["no_abstract"] += 0 if (papers[n - 1].get("abstract") or "").strip() else 1
+            rec["coverage"] += support
+            rec["exposure"] += risk
+
+    considered = len(records)
+    candidates = [n for n in records if _fetchable(papers[n - 1])]
+    candidate_set = set(candidates)
+    limit = _fulltext_budget_limit(len(rows), len(candidates))
+    if not fulltext.ENABLED:
+        limit = 0
+
+    def order(ns):
+        return sorted(ns, key=lambda n: (
+            -records[n]["exposure"], -len(records[n]["claims"]),
+            -records[n]["sole"], -records[n]["no_abstract"],
+            records[n]["coverage"], n))
+
+    selected, seen = [], set()
+
+    def take(n):
+        if n not in seen and len(selected) < limit:
+            seen.add(n)
+            selected.append(n)
+
+    # one first source per claim, weakest-evidence claims first
+    for row in sorted(rows, key=lambda r: (-r["risk"], r["support"], r["cid"])):
+        for n in order(row["ns"]):
+            if n in candidate_set and n not in seen:
+                take(n)
+                break
+    # remaining slots: papers that cover the most / least-covered claims
+    for n in order(candidates):
+        take(n)
+
+    return {
+        "mode": "disabled" if not fulltext.ENABLED else str(FULLTEXT_BUDGET),
+        "budget": limit,
+        "considered": considered,
+        "fetchable": len(candidates),
+        "no_address": considered - len(candidates),
+        "selected": len(selected),
+        "deferred": max(0, len(candidates) - len(selected)),
+        "selected_indices": selected,
+    }
 
 
 def retrieve_evidence(claim, pool):
@@ -372,7 +498,7 @@ def fetch_failed(note):
     return any(marker in low for marker in _FETCH_FAILURES)
 
 
-def _support_badge(supported, supporting, evidence):
+def _support_badge(supported, supporting, evidence, judged=True):
     """Classify how strong the support for one claim is.
 
     Returns (key, label, note). The key is stable for the UI to colour-code:
@@ -383,7 +509,14 @@ def _support_badge(supported, supporting, evidence):
       unsupported -- not backed by the evidence
       unfetched   -- judged unsupported, but a cited paper's text never
                      arrived, so the verdict rests on absent evidence
+      unjudged    -- the judge returned no usable verdict; this is not a
+                     negative result and must not be shown as 不支持
     """
+    if not judged:
+        return (
+            "unjudged", "无法核对（判决未完成）",
+            "LLM 未返回可解析的判决——这不是“不支持”，需要重跑或人工核对",
+        )
     if not supported:
         failed = [e for e in evidence if fetch_failed(e.get("note"))]
         if failed:
@@ -521,11 +654,13 @@ def _support_title(papers, n, answer_count):
     return title if n <= answer_count else f"{title}（补充检索）"
 
 
-def _collect_evidence(claims, papers, answer_count):
+def _collect_evidence(claims, papers, answer_count, fulltext_indices=None):
     """Gather the cited papers' evidence for every claim concurrently.
 
     `papers` is the full numbering (see _evidence_index); `answer_count` says
-    how many leading entries are the answer's own bibliography. Returns
+    how many leading entries are the answer's own bibliography.
+    `fulltext_indices` is the selected set from plan_fulltext_budget; papers
+    outside it contribute their abstract without a download attempt. Returns
     {claim_id: (blocks, evidence_items)} preserving citation order.
     """
     cited = _cited_for_all(claims, papers[:answer_count])
@@ -537,7 +672,9 @@ def _collect_evidence(claims, papers, answer_count):
     workers = max(1, min(EVIDENCE_WORKERS, len(tasks)))
 
     def one(claim, n):
-        return _paper_evidence(claim, papers[n - 1], n, in_answer=(n <= answer_count))
+        allow = fulltext_indices is None or n in fulltext_indices
+        return _paper_evidence(claim, papers[n - 1], n, allow_fetch=allow,
+                               in_answer=(n <= answer_count))
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         # copy_context() per task: a Context cannot be entered by two threads at
@@ -605,22 +742,25 @@ def _top_up_evidence(claims, verdicts, evidence_by_claim, papers, answer_count):
     return evidence_by_claim
 
 
-def judge_claims(claims, papers, answer_count=None):
+def judge_claims(claims, papers, answer_count=None, fulltext_indices=None):
     """Judge every claim against `papers` (see _evidence_index for the numbering).
 
     `answer_count` is the size of the answer's own bibliography; supporting
     numbers above it belong to evidence-only papers and are labelled as such.
+    `fulltext_indices` limits downloads to the papers selected by
+    plan_fulltext_budget; None keeps the old "try every cited paper" behaviour.
     """
     if answer_count is None:
         answer_count = len(papers)
     verdicts = {}
+    unjudged = set()
     parse_failures = []
     evidence_by_claim = {}
     passages_used = 0
 
     # 1) evidence for every claim's cited papers, in parallel
     _check_cancel()
-    collected = _collect_evidence(claims, papers, answer_count)
+    collected = _collect_evidence(claims, papers, answer_count, fulltext_indices)
     for c in claims:
         blocks, items = collected.get(c["id"], ([], []))
         evidence_by_claim[c["id"]] = items
@@ -653,17 +793,20 @@ def judge_claims(claims, papers, answer_count=None):
     _check_cancel()
     workers = max(1, min(JUDGE_WORKERS, len(batches)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(contextvars.copy_context().run, run_batch, b)
-                   for b in batches]
+        futures = {ex.submit(contextvars.copy_context().run, run_batch, b): b
+                   for b in batches}
         for fut in as_completed(futures):
+            batch = futures[fut]
             try:
-                batch, content = fut.result()
+                _, content = fut.result()
             except Exception as e:
                 parse_failures.append(f"judge call failed: {e}")
+                unjudged.update(c["id"] for c in batch)
                 continue
             batch_verdicts = llm.extract_verdicts(content, id_field="id")
             if not batch_verdicts:
                 parse_failures.append(f"claims {[c['id'] for c in batch]}")
+                unjudged.update(c["id"] for c in batch)
                 continue
             for v in batch_verdicts:
                 try:
@@ -677,22 +820,27 @@ def judge_claims(claims, papers, answer_count=None):
 
     structured = []
     for c in claims:
-        v = verdicts.get(c["id"], {})
-        supported = bool(v.get("supported"))
+        v = verdicts.get(c["id"])
+        judged = (c["id"] not in unjudged and isinstance(v, dict)
+                  and isinstance(v.get("supported"), bool))
+        supported = bool(v.get("supported")) if judged else False
         supporting = []
-        for n in v.get("supporting", []):
-            try:
-                supporting.append(int(n))
-            except (TypeError, ValueError):
-                pass
-        reason = str(v.get("reason", "")).strip()
+        if judged:
+            for n in v.get("supporting", []):
+                try:
+                    supporting.append(int(n))
+                except (TypeError, ValueError):
+                    pass
+        reason = str(v.get("reason", "")).strip() if isinstance(v, dict) else ""
         evidence = evidence_by_claim.get(c["id"], [])
-        badge, badge_label, badge_note = _support_badge(supported, supporting, evidence)
+        badge, badge_label, badge_note = _support_badge(
+            supported, supporting, evidence, judged=judged)
         structured.append({
             "id": c["id"],
             "text": c["text"],
             "section": c.get("section"),
             "citations": c.get("citations", []),
+            "judged": judged,
             "supported": supported,
             "supporting": supporting,
             "badge": badge,
@@ -705,19 +853,24 @@ def judge_claims(claims, papers, answer_count=None):
 
     lines = []
     for label in parse_failures:
-        lines.append(("bad", f"LLM returned no parseable verdicts for {label}"))
+        if label.startswith("judge call failed:"):
+            lines.append(("bad", "LLM judge call failed: "
+                          + label.split(":", 1)[1].strip()))
+        else:
+            lines.append(("bad", f"LLM returned no parseable verdicts for {label}"))
     for item in structured:
         c, supported, supporting, reason, titles = (
             item["text"], item["supported"], item["supporting"], item["reason"], item["titles"],
         )
         if supported:
             lines.append(("ok", f"Claim {item['id']}: SUPPORTED ({', '.join(titles) or 'cited papers'})"))
-        elif item["badge"] == "unfetched":
+        elif item["badge"] in ("unfetched", "unjudged"):
             # not a failure of the answer: the check did not happen, so the log
             # says so instead of reporting the claim as unsupported
+            kind = "UNCHECKED" if item["badge"] == "unfetched" else "UNJUDGED"
             lines.append((
                 "warn",
-                f"Claim {item['id']}: UNCHECKED (no source text retrieved) -> {c[:110]}"
+                f"Claim {item['id']}: {kind} -> {c[:110]}"
                 f" | {item['badge_note']}",
             ))
         else:
@@ -837,21 +990,33 @@ def _run(answer, papers, pool):
     # download the cited papers' full texts up front, in parallel, so the
     # judging loop below hits the cache instead of paying N serial downloads
     cited = _cited_papers(claims, papers)
+    plan = plan_fulltext_budget(claims, papers, pool)
     if cited:
         # downloads are the slowest single step of this stage: check first so a
         # stop does not sit through the whole prefetch
         _check_cancel()
         _offer_alternative_urls(cited)
-        t0 = time.monotonic()
-        scheduled = fulltext.prefetch_fulltexts(cited)
-        if scheduled:
-            print(f"      Prefetched {scheduled} full texts in {time.monotonic() - t0:.1f}s")
+        # OpenAlex may have supplied a second address for a paper that had
+        # none, so the plan is made after that lookup.
+        plan = plan_fulltext_budget(claims, papers, pool)
+        selected = [papers[n - 1] for n in plan["selected_indices"]]
+        if plan["considered"]:
+            print(f"      Full-text budget: {plan['selected']}/{plan['fetchable']} "
+                  f"fetchable cited papers selected (mode {plan['mode']}, "
+                  f"deferred {plan['deferred']} to abstract-only)")
+        if selected:
+            t0 = time.monotonic()
+            scheduled = fulltext.prefetch_fulltexts(selected)
+            if scheduled:
+                print(f"      Prefetched {scheduled} full texts in {time.monotonic() - t0:.1f}s")
     print("      Judging claim support...")
     _check_cancel()
     lines, structured, parse_failures, passages_used = judge_claims(
-        claims, index, answer_count=len(papers)
+        claims, index, answer_count=len(papers),
+        fulltext_indices=plan["selected_indices"],
     )
     stats = fulltext.stats_summary()
+    stats["budget"] = {k: v for k, v in plan.items() if k != "selected_indices"}
     print(f"      Full text: {stats['cache_hits'] + stats['memo_hits']} cache hits, "
           f"{stats['downloads']} downloads, {stats['download_failed']} failed, "
           f"{stats['download_seconds']:.1f}s downloading "

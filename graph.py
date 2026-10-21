@@ -15,6 +15,7 @@ import os
 import threading
 import time
 import uuid
+from datetime import datetime
 from typing import Annotated, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -136,6 +137,8 @@ _hooks = {}           # run key -> (on_stage, on_timing)
 _hooks_lock = threading.Lock()
 
 _checkpointer = InMemorySaver() if CHECKPOINT_ENABLED else None
+_checkpoint_used = {}       # thread id -> monotonic last access, for pruning
+_checkpoint_used_lock = threading.Lock()
 
 
 # ------------------------------------------------------- stopping a run
@@ -168,6 +171,7 @@ def begin_run(key):
     because end_run() removes the entry.
     """
     key = str(key)
+    _touch_checkpoint(key)
     with _cancel_lock:
         event = _cancel_events.get(key)
         if event is None:
@@ -269,6 +273,7 @@ def checkpoint_info(thread_id):
     """What is stored for one run: {exists, next, checkpoints} (for the UI)."""
     if not (CHECKPOINT_ENABLED and thread_id):
         return {"exists": False, "next": [], "checkpoints": 0}
+    _touch_checkpoint(thread_id)
     try:
         app = get_app()
         state = app.get_state(_config(thread_id))
@@ -293,6 +298,7 @@ def snapshot_state(thread_id):
     """Best-effort read of the checkpointed state (for a stopped run's summary)."""
     if not (CHECKPOINT_ENABLED and thread_id):
         return {}
+    _touch_checkpoint(thread_id)
     try:
         state = get_app().get_state(_config(thread_id))
     except Exception:
@@ -306,20 +312,73 @@ def drop_checkpoint(thread_id):
     if not (CHECKPOINT_ENABLED and thread_id):
         return False
     try:
-        return bool(_checkpointer.delete_thread(thread_id))
+        _checkpointer.delete_thread(thread_id)
     except Exception:
         return False
+    with _checkpoint_used_lock:
+        _checkpoint_used.pop(str(thread_id), None)
+    return True
+
+
+def _touch_checkpoint(thread_id):
+    if thread_id:
+        with _checkpoint_used_lock:
+            _checkpoint_used[str(thread_id)] = time.monotonic()
+
+
+def _checkpoint_time(thread_id, storage):
+    """Latest checkpoint timestamp for a thread, falling back to last use."""
+    latest = 0.0
+    try:
+        namespaces = storage.get(thread_id) or {}
+        for entries in namespaces.values():
+            for entry in entries.values():
+                try:
+                    checkpoint = _checkpointer.serde.loads_typed(entry[0])
+                    ts = checkpoint.get("ts")
+                    if ts:
+                        latest = max(latest, datetime.fromisoformat(
+                            str(ts).replace("Z", "+00:00")).timestamp())
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    with _checkpoint_used_lock:
+        used = _checkpoint_used.get(str(thread_id), 0.0)
+    return max(latest, used)
+
+
+def _active_checkpoint_threads():
+    with _cancel_lock:
+        active = set(_cancel_events)
+    with _hooks_lock:
+        active.update(_hooks)
+    current = getattr(_current_run, "key", None)
+    if current:
+        active.add(str(current))
+    return active
 
 
 def prune_checkpoints(keep=None):
-    """Keep only the `keep` most recently written threads (memory is finite)."""
+    """Keep the `keep` most recently used threads, never dropping a live run.
+
+    InMemorySaver.storage is a nested dict with insertion order, not an LRU.
+    Each thread is ranked by its latest checkpoint timestamp (the checkpoint
+    carries `ts`), with begin_run/checkpoint_info/snapshot_state as a fallback
+    touch. Threads with a registered cancel event or progress hook are active
+    and are excluded from eviction even when they fall outside the top `keep`.
+    """
     if not CHECKPOINT_ENABLED:
         return 0
     keep = MAX_THREADS if keep is None else keep
     storage = getattr(_checkpointer, "storage", None)
     if not isinstance(storage, dict) or len(storage) <= keep:
         return 0
-    victims = list(storage.keys())[:-keep]
+    thread_ids = list(storage.keys())
+    ranked = sorted(thread_ids, key=lambda tid: _checkpoint_time(tid, storage),
+                    reverse=True)
+    protected = set(ranked[:max(0, keep)]) | _active_checkpoint_threads()
+    victims = [tid for tid in thread_ids if tid not in protected]
     dropped = 0
     for tid in victims:
         if drop_checkpoint(tid):
@@ -710,6 +769,19 @@ def node_retrieve(state):
                 + errors[0][:400]
                 + "\n  提示：先确认本机能访问外网（直连通常不通，需要代理），"
                   "再检查 .env 里的 HTTP_PROXY / HTTPS_PROXY 是否可用。"
+            )
+        sources = [s for q in queries_log for s in (q.get("sources") or [])]
+        attempted = [s for s in sources if not s.get("skipped")]
+        breaker = [s for s in sources if s.get("skip_reason") == "breaker"]
+        if not attempted and breaker:
+            # A tripped circuit breaker is not an empty result either. Every
+            # source was skipped before a request was sent, so this round has
+            # no evidence about what the literature contains.
+            names = sorted({s.get("source") or "?" for s in breaker})
+            raise RuntimeError(
+                "所有检索数据源都在熔断冷却中，本次没有真正发出检索请求"
+                "（这不是「没有相关文献」）：" + "、".join(names)
+                + "\n  提示：数据源近期失败后会被临时跳过，等待冷却结束或检查代理后再试。"
             )
     tier = journal.current_filter()
     if tier is not None and tier.enabled:

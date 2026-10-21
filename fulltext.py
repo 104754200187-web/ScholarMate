@@ -13,6 +13,7 @@ import contextvars
 
 import atomicio
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -20,8 +21,10 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 FULLTEXT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fulltext_cache")
@@ -34,12 +37,17 @@ MIN_TEXT_CHARS = 200
 
 _UA = "Mozilla/5.0 (X11; Linux x86_64) research-agent/0.1 (literature agent)"
 _ARXIV_ABS = re.compile(r"arxiv\.org/(?:abs|pdf)/([^/?#]+)")
-_memo = {}  # cache key -> (text, note); avoids re-downloading within a run
+_memo = OrderedDict()  # cache key -> (text, note); bounded process-wide cache
+_memo_lock = threading.Lock()
+MEMO_MAX_ENTRIES = int(os.environ.get("FULLTEXT_MEMO_MAX_ENTRIES", "128"))
+MEMO_MAX_CHARS = int(os.environ.get("FULLTEXT_MEMO_MAX_CHARS", str(32 * 1024 * 1024)))
 # DOI -> openly available PDF URL, filled once per run by the caller from
 # OpenAlex (search.openalex_oa_pdf_urls). Merged rather than replaced: a DOI
 # names one paper no matter which run asked, so a second run's map can only add
 # addresses. Used for papers whose own URL is missing or known to fail only.
-_oa_urls = {}
+_oa_urls = OrderedDict()
+_oa_urls_lock = threading.Lock()
+OA_URL_MAX_ENTRIES = int(os.environ.get("FULLTEXT_OA_URL_MAX_ENTRIES", "20000"))
 
 # Latency controls. A slow PDF used to cost up to timeout*retries (~180s); with
 # a shorter timeout and fewer retries the worst case is ~50s, and downloads run
@@ -55,6 +63,11 @@ ARXIV_MIN_GAP = 3.0  # arXiv asks for >=3s between requests
 # not the byte count -- is what has to be capped.
 MAX_PDF_BYTES = int(os.environ.get("FULLTEXT_MAX_BYTES", "8000000"))
 EXTRACT_TIMEOUT = int(os.environ.get("FULLTEXT_EXTRACT_TIMEOUT", "20"))
+# A FlateDecode stream can expand far beyond the PDF that carries it. Cap the
+# decompressed bytes so one small file cannot make the extractor allocate
+# hundreds of megabytes.
+MAX_INFLATE_BYTES = int(os.environ.get("FULLTEXT_MAX_INFLATE_BYTES",
+                                       str(32 * 1024 * 1024)))
 # A paywalled (403) or too-slow PDF stays unavailable for days, and re-paying
 # 20s+ for it on every run of every question is pure waste: remember the
 # failures on disk. 0 disables the markers.
@@ -64,6 +77,7 @@ SKIP_TTL = float(os.environ.get("FULLTEXT_SKIP_TTL", str(7 * 86400)))
 SKIP_TTL_TRANSIENT = float(
     os.environ.get("FULLTEXT_SKIP_TTL_TRANSIENT", str(6 * 3600)))
 EXTRACT_CONCURRENCY = int(os.environ.get("FULLTEXT_EXTRACT_CONCURRENCY", "2"))
+SKIP_MAX_ENTRIES = int(os.environ.get("FULLTEXT_SKIP_MAX_ENTRIES", "5000"))
 
 STATS = {
     "memo_hits": 0,        # served from this run's memory
@@ -99,6 +113,34 @@ def reset_stats():
         for k in STATS:
             STATS[k] = 0.0 if isinstance(STATS[k], float) else 0
     _deadline.set(None)
+
+
+def _memo_weight(value):
+    text, note = value if isinstance(value, tuple) else (value, "")
+    return len(text or "") + len(note or "")
+
+
+def _memo_get(key):
+    with _memo_lock:
+        return _memo.get(key)
+
+
+def _memo_has(key):
+    with _memo_lock:
+        return key in _memo
+
+
+def _memo_put(key, text, note):
+    """Store one result and evict oldest entries to keep both caps."""
+    value = (text, note)
+    with _memo_lock:
+        _memo.pop(key, None)
+        _memo[key] = value
+        while _memo and (len(_memo) > max(0, MEMO_MAX_ENTRIES)
+                         or sum(_memo_weight(v) for v in _memo.values())
+                         > max(0, MEMO_MAX_CHARS)):
+            _memo.popitem(last=False)
+    return value
 
 
 def _bump(field, amount=1):
@@ -168,8 +210,18 @@ def _load_skips():
         _skips = loaded if isinstance(loaded, dict) else {}
     except Exception:
         _skips = {}
+    changed = False
     for key, rec in list(_skips.items()):
-        _skips[key] = _migrated(rec)
+        slots = _migrated(rec)
+        fresh = {addr: slot for addr, slot in slots.items() if _fresh(slot)}
+        if fresh:
+            _skips[key] = fresh
+        else:
+            _skips.pop(key, None)
+        if fresh != slots:
+            changed = True
+    if _trim_skips() or changed:
+        _save_skips()
     _skips_loaded = True
 
 
@@ -204,6 +256,30 @@ def _save_skips():
         atomicio.write_json(_skips_path(), _skips)
     except Exception:
         pass
+
+
+def _trim_skips():
+    """Drop expired papers and keep only the newest SKIP_MAX_ENTRIES."""
+    changed = False
+    for key, slots in list(_skips.items()):
+        fresh = {addr: slot for addr, slot in slots.items() if _fresh(slot)}
+        if fresh != slots:
+            changed = True
+        if fresh:
+            _skips[key] = fresh
+        else:
+            _skips.pop(key, None)
+    cap = max(0, SKIP_MAX_ENTRIES)
+    if len(_skips) > cap:
+        def newest(slots):
+            return max((float(slot.get("at") or 0) for slot in slots.values()),
+                       default=0.0)
+        keep = set(sorted(_skips, key=lambda k: newest(_skips[k]), reverse=True)[:cap])
+        for key in list(_skips):
+            if key not in keep:
+                _skips.pop(key, None)
+        changed = True
+    return changed
 
 
 def _skip_reason(key, url=""):
@@ -250,6 +326,7 @@ def _mark_skip(key, reason, ttl=None, url=""):
         slots = _skips.setdefault(key, {})
         slots[((url or "").strip()[:500] or _SKIP_ANY)] = {
             "reason": str(reason)[:200], "at": time.time(), "ttl": ttl}
+        _trim_skips()
         _save_skips()
 
 
@@ -281,10 +358,72 @@ def _is_connection_failure(reason):
                 "connection refused", "unreachable"))
 
 
+_LOCAL_HOST_SUFFIXES = (
+    ".localhost", ".local", ".internal", ".home.arpa",
+    # public wildcard-DNS domains commonly used to point a name at loopback
+    ".nip.io", ".sslip.io", ".xip.io", ".localtest.me", ".lvh.me", ".vcap.me",
+)
+
+
+def _validate_url(url):
+    """Return a URL a PDF download is allowed to touch, or raise ValueError.
+
+    Only http/https is accepted: urllib would otherwise happily read file://
+    and other local schemes when a search result or a landing page supplies the
+    address. Literal loopback/private/link-local addresses are rejected here,
+    and the redirect handler applies the same check to every hop.
+
+    Hostnames are deliberately not resolved locally: this deployment reaches
+    the internet through a proxy, where resolving the target host would add a
+    DNS dependency (and fail) for URLs the proxy can fetch. The local-name and
+    wildcard-DNS suffixes above cover the usual non-literal bypasses.
+    """
+    if not isinstance(url, str):
+        raise ValueError("URL must be a string")
+    url = url.strip()
+    if any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ValueError("URL contains a control character")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {parts.scheme or '(none)'}")
+    if parts.username or parts.password:
+        raise ValueError("URL must not carry credentials")
+    host = (parts.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError("URL has no host")
+    if host == "localhost" or host.endswith(_LOCAL_HOST_SUFFIXES):
+        raise ValueError(f"local host is not allowed: {host}")
+    try:
+        port = parts.port
+    except ValueError as e:
+        raise ValueError(f"invalid URL port: {e}") from None
+    if port not in (None, 80, 443):
+        raise ValueError(f"URL port is not allowed: {port}")
+    # Numeric hosts that ipaddress cannot parse (127.1, 2130706433, 0x7f000001)
+    # are alternate spellings a resolver may still turn into a private address.
+    numeric = re.fullmatch(r"[0-9.]+", host) or host.startswith("0x")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if numeric or ":" in host or "%" in host or re.search(r"\s", host):
+            raise ValueError(f"ambiguous or invalid host: {host}") from None
+    else:
+        if not ip.is_global:
+            raise ValueError(f"non-public IP address is not allowed: {host}")
+    return url
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _http_get(url, timeout=None, retries=None, max_bytes=None):
     """max_bytes overrides the module cap: text extraction is CPU-bound and
     needs a small one, while a caller that only stores the bytes (pdfpack) can
     afford a bigger file."""
+    url = _validate_url(url)
     cap = MAX_PDF_BYTES if max_bytes is None else int(max_bytes)
     timeout = DOWNLOAD_TIMEOUT if timeout is None else timeout
     retries = DOWNLOAD_RETRIES if retries is None else retries
@@ -293,7 +432,8 @@ def _http_get(url, timeout=None, retries=None, max_bytes=None):
     last_err = None
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            opener = urllib.request.build_opener(_SafeRedirectHandler())
+            with opener.open(req, timeout=timeout) as resp:
                 declared = resp.headers.get("Content-Length")
                 if declared and declared.isdigit() and int(declared) > cap:
                     raise RuntimeError(
@@ -414,16 +554,37 @@ def _printable_ratio(text):
     return good / len(text)
 
 
+def _inflate_bounded(stream, wbits):
+    """Inflate one stream with a hard output cap.
+
+    Returns (data, too_large). `decompress(..., max_length)` leaves the rest
+    in `unconsumed_tail` when output hits the limit, so no allocation beyond
+    the cap occurs before we can reject it.
+    """
+    cap = max(0, MAX_INFLATE_BYTES)
+    d = zlib.decompressobj(wbits)
+    try:
+        out = d.decompress(stream, cap + 1)
+        if len(out) > cap or d.unconsumed_tail:
+            return b"", True
+        tail = d.flush()
+    except zlib.error:
+        return b"", False
+    out += tail
+    if len(out) > cap:
+        return b"", True
+    return out, False
+
+
 def _decompress(stream):
-    try:
-        return zlib.decompress(stream)
-    except Exception:
-        pass
-    d = zlib.decompressobj()
-    try:
-        return d.decompress(stream) + d.flush()
-    except Exception:
-        return b""
+    # zlib wrapper first, then raw deflate (some PDFs omit the wrapper).
+    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        data, too_large = _inflate_bounded(stream, wbits)
+        if too_large:
+            return b""
+        if data:
+            return data
+    return b""
 
 
 def extract_pdf_text(data):
@@ -559,8 +720,14 @@ def doi_key(value):
 
 def set_oa_urls(mapping):
     """Remember the open-access PDF URLs a caller looked up (see sentences.py)."""
-    if mapping:
-        _oa_urls.update(mapping)
+    if not mapping:
+        return
+    with _oa_urls_lock:
+        for key, url in mapping.items():
+            _oa_urls[key] = url
+            _oa_urls.move_to_end(key)
+        while len(_oa_urls) > max(0, OA_URL_MAX_ENTRIES):
+            _oa_urls.popitem(last=False)
 
 
 def alternative_pdf_url(paper):
@@ -571,7 +738,10 @@ def alternative_pdf_url(paper):
     with set_oa_urls. Addresses we already have are not repeated.
     """
     key = doi_key(paper)
-    url = _oa_urls.get(key) if key else ""
+    if not key:
+        return ""
+    with _oa_urls_lock:
+        url = _oa_urls.get(key, "")
     return url if url and url != pdf_url_for(paper) else ""
 
 
@@ -627,7 +797,12 @@ def looks_like_pdf(data):
 def _cache_key(paper):
     aid = (paper.get("arxiv_id") or "").strip()
     if aid:
-        return aid
+        # A normal arXiv id is a safe single path component and keeps the
+        # cache readable. Anything else (a slash, "..", an absolute path) is
+        # hashed so it can never escape FULLTEXT_CACHE.
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", aid):
+            return aid
+        return hashlib.sha1(aid.encode()).hexdigest()[:16]
     pdf = (paper.get("pdf_url") or "").strip()
     if pdf:
         return hashlib.sha1(pdf.encode()).hexdigest()[:16]
@@ -748,31 +923,31 @@ def get_fulltext(paper):
     if not ENABLED:
         return "", "fulltext disabled"
     key = _cache_key(paper)
-    if key in _memo:
+    hit = _memo_get(key)
+    if hit is not None:
         _bump("memo_hits")
-        return _memo[key]
+        return hit
     with _key_lock(key):
-        if key in _memo:  # another worker finished it while we waited
+        hit = _memo_get(key)
+        if hit is not None:  # another worker finished it while we waited
             _bump("memo_hits")
-            return _memo[key]
+            return hit
         os.makedirs(FULLTEXT_CACHE, exist_ok=True)
         path = os.path.join(FULLTEXT_CACHE, f"{key}.txt")
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 text = f.read()
-            _memo[key] = (text, "cached")
+            value = _memo_put(key, text, "cached")
             _bump("cache_hits")
-            return _memo[key]
+            return value
         alt = alternative_pdf_url(paper)   # OpenAlex's copy, "" when unknown
         candidates = list(dict.fromkeys([u for u in (pdf_url_for(paper), alt) if u]))
         if not candidates:
-            _memo[key] = ("", "no full-text URL")
-            return _memo[key]
+            return _memo_put(key, "", "no full-text URL")
         skipped = [_skip_reason(key, url) for url in candidates]
         if all(skipped):
             _bump("skip_markers")
-            _memo[key] = ("", f"skipped, unavailable in a recent run: {skipped[0]}")
-            return _memo[key]
+            return _memo_put(key, "", f"skipped, unavailable in a recent run: {skipped[0]}")
         last_err = ""
         for i, url in enumerate(candidates):
             if skipped[i]:
@@ -786,14 +961,11 @@ def get_fulltext(paper):
             text, note = _read_one(key, path, url)
             if text:
                 _clear_skip(key)
-                _memo[key] = (text, note)
-                return _memo[key]
+                return _memo_put(key, text, note)
             if "deadline reached" in note:
-                _memo[key] = ("", note)
-                return _memo[key]
+                return _memo_put(key, "", note)
             last_err = note
-        _memo[key] = ("", last_err or "no full text")
-        return _memo[key]
+        return _memo_put(key, "", last_err or "no full text")
 
 
 def prefetch_fulltexts(papers):
@@ -807,7 +979,7 @@ def prefetch_fulltexts(papers):
         if not p or not (pdf_url_for(p) or alternative_pdf_url(p)):
             continue
         key = _cache_key(p)
-        if key in _memo:
+        if _memo_has(key):
             continue
         if os.path.exists(os.path.join(FULLTEXT_CACHE, f"{key}.txt")):
             continue

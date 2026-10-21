@@ -21,12 +21,14 @@ on every log line would be megabytes of pointless I/O.
 
 import json
 import os
+import socket
 import sqlite3
 import threading
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("JOBSTORE_DB") or os.path.join(BASE_DIR, "outputs", "jobs.db")
+STALE_AFTER_S = float(os.environ.get("JOBSTORE_STALE_S", "300"))
 
 # the streaming half of a job: cheap to rewrite, and the only part that changes
 # while a run is in flight
@@ -38,6 +40,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status     TEXT NOT NULL,
     mode       TEXT,
     owner      TEXT,
+    worker     TEXT,
+    heartbeat_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     payload    TEXT NOT NULL,
@@ -52,6 +56,10 @@ CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, created_at);
 
 _conn = None
 _lock = threading.RLock()
+
+
+def _instance_id():
+    return f"{socket.gethostname()}:{os.getpid()}"
 
 
 def configure(path):
@@ -94,7 +102,7 @@ def _connect():
 
 
 def init():
-    """Create the table, adding the owner column to a table that predates it."""
+    """Create the table and migrate columns added after the first schema."""
     with _lock:
         conn = _connect()
         conn.executescript(_SCHEMA)
@@ -103,6 +111,10 @@ def init():
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
         if "owner" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN owner TEXT")
+        if "worker" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN worker TEXT")
+        if "heartbeat_at" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT")
         conn.executescript(_INDEXES)
 
 
@@ -124,17 +136,26 @@ def _save(job):
     body, progress = _split(job)
     body.setdefault("created_at", _now())
     jid = str(job["id"])
+    now = _now()
+    running = str(job.get("status") or "") == "running"
     _connect().execute(
-        "INSERT INTO jobs (id, status, mode, owner, created_at, updated_at, payload, progress) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "INSERT INTO jobs (id, status, mode, owner, worker, heartbeat_at, "
+        "                  created_at, updated_at, payload, progress) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET status=excluded.status, mode=excluded.mode, "
         # COALESCE: a caller that saved a job dict without an owner (an old record
         # read back, say) must not blank the ownership out from under it
         "owner=COALESCE(excluded.owner, jobs.owner), "
+        "worker=COALESCE(excluded.worker, jobs.worker), "
+        "heartbeat_at=CASE WHEN excluded.status='running' "
+        "                  THEN COALESCE(excluded.heartbeat_at, jobs.heartbeat_at) "
+        "                  ELSE jobs.heartbeat_at END, "
         "updated_at=excluded.updated_at, payload=excluded.payload, "
         "progress=excluded.progress",
         (jid, str(job.get("status") or "queued"), str(job.get("mode") or ""),
-         (job.get("owner") or None), body["created_at"], _now(),
+         (job.get("owner") or None), (job.get("worker") or None),
+         now if running else (job.get("heartbeat_at") or None),
+         body["created_at"], now,
          json.dumps(body, ensure_ascii=False),
          json.dumps(progress, ensure_ascii=False)),
     )
@@ -144,9 +165,12 @@ def save_progress(jid, job):
     """Write out only the streaming half, for the log tail of a live run."""
     _, progress = _split(job)
     with _lock:
+        now = _now()
         _connect().execute(
-            "UPDATE jobs SET progress=?, updated_at=? WHERE id=?",
-            (json.dumps(progress, ensure_ascii=False), _now(), str(jid)),
+            "UPDATE jobs SET progress=?, updated_at=?, "
+            "heartbeat_at=CASE WHEN status='running' THEN ? ELSE heartbeat_at END "
+            "WHERE id=?",
+            (json.dumps(progress, ensure_ascii=False), now, now, str(jid)),
         )
 
 
@@ -160,26 +184,30 @@ def get(jid):
     """
     with _lock:
         row = _connect().execute(
-            "SELECT id, status, mode, owner, created_at, updated_at, payload, progress "
+            "SELECT id, status, mode, owner, worker, heartbeat_at, "
+            "       created_at, updated_at, payload, progress "
             "FROM jobs WHERE id=?", (str(jid),)).fetchone()
     if row is None:
         return None
     job = json.loads(row["payload"])
     job.update(json.loads(row["progress"] or "{}"))
     job.update({"id": row["id"], "status": row["status"], "created_at": row["created_at"],
-                "updated_at": row["updated_at"], "owner": row["owner"] or ""})
+                "updated_at": row["updated_at"], "owner": row["owner"] or "",
+                "worker": row["worker"] or "",
+                "heartbeat_at": row["heartbeat_at"] or ""})
     if row["mode"]:
         job["mode"] = row["mode"]
     return job
 
 
-def claim_next():
+def claim_next(instance=None):
     """Take the oldest queued job and mark it running, atomically.
 
     Returns the job dict, or None when the queue is empty. The transaction is
     what lets several workers share this table later: whoever gets the row is
     the one that runs it.
     """
+    instance = instance or _instance_id()
     with _lock:
         conn = _connect()
         conn.execute("BEGIN IMMEDIATE")
@@ -192,12 +220,14 @@ def claim_next():
             jid = row["id"]
             now = _now()
             changed = conn.execute(
-                "UPDATE jobs SET status='running', updated_at=? "
-                "WHERE id=? AND status='queued'", (now, jid)).rowcount
+                "UPDATE jobs SET status='running', updated_at=?, worker=?, "
+                "heartbeat_at=? WHERE id=? AND status='queued'",
+                (now, instance, now, jid)).rowcount
             if changed != 1:
                 return None
-            payload, progress = conn.execute(
-                "SELECT payload, progress FROM jobs WHERE id=?", (jid,)).fetchone()
+            saved = conn.execute(
+                "SELECT payload, progress, worker, heartbeat_at "
+                "FROM jobs WHERE id=?", (jid,)).fetchone()
             conn.execute("COMMIT")
             committed = True
         finally:
@@ -208,9 +238,11 @@ def claim_next():
                     conn.execute("ROLLBACK")
                 except sqlite3.Error:
                     pass
-    job = json.loads(payload)
-    job.update(json.loads(progress or "{}"))
+    job = json.loads(saved["payload"])
+    job.update(json.loads(saved["progress"] or "{}"))
     job.update({"status": "running", "started_at": now,
+                "worker": saved["worker"] or instance,
+                "heartbeat_at": saved["heartbeat_at"] or now,
                 "stage": job.get("stage") or "排队中…"})
     return job
 
@@ -226,23 +258,87 @@ def _finish_running(conn, row, note):
          json.dumps(progress, ensure_ascii=False), row["id"]))
 
 
-def recover():
-    """Settle the jobs the previous process left behind.
+def _heartbeat_age(heartbeat_at, now=None):
+    try:
+        then = datetime.fromisoformat(str(heartbeat_at))
+    except (TypeError, ValueError):
+        return None
+    return ((now or datetime.now()) - then).total_seconds()
 
-    A run cannot survive a restart: its LangGraph checkpoints live in memory,
-    so a job left ``running`` is not resumable and is marked failed with that
-    reason rather than silently reported as still alive. A job still ``queued``
-    is left alone -- it never started, so nothing was lost and the worker will
-    simply pick it up again.
+
+def _worker_process_alive(worker):
+    """True/False for a worker on this host, None when it is another host."""
+    try:
+        host, raw_pid = str(worker or "").rsplit(":", 1)
+        pid = int(raw_pid)
+    except (TypeError, ValueError):
+        return None
+    if host != socket.gethostname() or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _should_recover(row, stale_after, now=None):
+    """(settle?, reason) for one running row owned by another instance."""
+    worker = str(row["worker"] or "")
+    if not worker:
+        return True, "升级前的任务没有实例记录（断点未持久化，请重新提问）"
+    alive = _worker_process_alive(worker)
+    if alive is False:
+        return True, "任务所在实例已退出（断点未持久化，请重新提问）"
+    if alive is True:
+        return False, ""
+    age = _heartbeat_age(row["heartbeat_at"], now=now)
+    if age is None or age > stale_after:
+        return True, "任务所在实例心跳超时（断点未持久化，请重新提问）"
+    return False, ""
+
+
+def recover(instance=None, stale_after=None):
+    """Settle only running jobs whose worker is known to be gone.
+
+    A run cannot survive its process: LangGraph checkpoints live in memory. A
+    second web instance must not, however, fail the first instance's live
+    jobs. Rows carry ``worker`` (host:pid) and ``heartbeat_at``; this routine
+    settles ownerless legacy rows, dead same-host processes, and other-host
+    workers whose heartbeat is older than ``stale_after``. A fresh heartbeat
+    from another host is left untouched. Queued jobs are never touched.
     """
+    del instance  # the caller identity is used by claim_next(); kept in API
+    stale_after = STALE_AFTER_S if stale_after is None else float(stale_after)
+    now = datetime.now()
     with _lock:
         conn = _connect()
-        rows = conn.execute(
-            "SELECT id, payload FROM jobs WHERE status='running'").fetchall()
-        for row in rows:
-            _finish_running(conn, row,
-                            "平台重启，任务在执行中被中断（断点未持久化，请重新提问）")
-        return [row["id"] for row in rows]
+        conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            rows = conn.execute(
+                "SELECT id, payload, worker, heartbeat_at FROM jobs "
+                "WHERE status='running'").fetchall()
+            victims = []
+            for row in rows:
+                settle, reason = _should_recover(row, stale_after, now=now)
+                if not settle:
+                    continue
+                _finish_running(conn, row, reason)
+                victims.append(row["id"])
+            conn.execute("COMMIT")
+            committed = True
+            return victims
+        finally:
+            if not committed:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
 
 
 def import_history(directory):

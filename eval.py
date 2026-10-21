@@ -69,7 +69,8 @@ def summarize_snapshots(path):
     rows = []
     for fp in sorted(glob.glob(os.path.join(path, "*.json"))):
         try:
-            data = json.load(open(fp))
+            with open(fp, encoding="utf-8") as f:
+                data = json.load(f)
         except Exception:
             continue
         if data.get("mode") != "ask":
@@ -77,12 +78,19 @@ def summarize_snapshots(path):
         rules = data.get("audits", {}).get("rules", {}).get("items", [])
         llm = data.get("audits", {}).get("llm", {}).get("verdicts", [])
         claims = data.get("audits", {}).get("claims", {}).get("verdicts", [])
+        def unjudged(item):
+            return (item.get("judged") is False or item.get("badge") == "unjudged"
+                    or "supported" not in item)
         rows.append({
             "id": data.get("id"),
             "rule_bad": sum(1 for i in rules if i.get("status") == "bad"),
-            "llm_unsupported": sum(1 for v in llm if not v.get("supported")),
+            "llm_unsupported": sum(1 for v in llm
+                                   if not v.get("supported") and not unjudged(v)),
+            "llm_unjudged": sum(1 for v in llm if unjudged(v)),
             "llm_total": len(llm),
-            "claims_unsupported": sum(1 for c in claims if not c.get("supported")),
+            "claims_unsupported": sum(1 for c in claims
+                                      if not c.get("supported") and not unjudged(c)),
+            "claims_unjudged": sum(1 for c in claims if unjudged(c)),
             "claims_total": len(claims),
         })
     if not rows:
@@ -94,8 +102,10 @@ def summarize_snapshots(path):
         "snapshots": len(rows),
         "avg_rule_bad": avg("rule_bad"),
         "avg_llm_unsupported": avg("llm_unsupported"),
+        "avg_llm_unjudged": avg("llm_unjudged"),
         "avg_llm_total": avg("llm_total"),
         "avg_claims_unsupported": avg("claims_unsupported"),
+        "avg_claims_unjudged": avg("claims_unjudged"),
         "avg_claims_total": avg("claims_total"),
     }
 

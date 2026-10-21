@@ -92,7 +92,15 @@ def paper_key(paper):
 
 def _path(run_id):
     safe = re.sub(r"[^\w.\-]", "", str(run_id or ""))
-    return os.path.join(SCREENING_DIR, safe + ".json") if safe else ""
+    if safe in ("", ".", ".."):
+        return ""
+    path = os.path.join(SCREENING_DIR, safe + ".json")
+    # Defense in depth: the web layer already rejects malformed run ids, but a
+    # caller reaching this module directly must not be able to name a path
+    # outside the screening directory.
+    if os.path.realpath(os.path.dirname(path)) != os.path.realpath(SCREENING_DIR):
+        return ""
+    return path
 
 
 def load(run_id):

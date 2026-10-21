@@ -136,9 +136,13 @@ def extract_verdicts(text, id_field="n"):
         seg = text[m.start():m.start() + 400]
         sup = re.search(r'"supported"\s*:\s*(true|false)', seg)
         reason = re.search(r'"reason"\s*:\s*"([^"]*)"', seg)
-        out.append({
+        item = {
             id_field: int(m.group(1)),
-            "supported": sup.group(1) == "true" if sup else False,
             "reason": reason.group(1) if reason else "",
-        })
+        }
+        # A missing supported field is not a negative verdict. Leaving it out
+        # lets judge_claims() mark the claim as unjudged instead of unsupported.
+        if sup:
+            item["supported"] = sup.group(1) == "true"
+        out.append(item)
     return out

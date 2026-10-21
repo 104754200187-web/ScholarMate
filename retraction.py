@@ -285,11 +285,16 @@ def _run_crossref(items, cache, deadline, budget, missing=None):
     # shrink the per-request timeout as the deadline approaches, so a request
     # still in flight cannot overrun the stage by a full timeout
     timeout = max(1.0, min(HTTP_TIMEOUT, deadline - time.monotonic()))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    # Do not use the executor as a context manager: __exit__ waits for every
+    # submitted future, which would make the wall-clock deadline a soft one.
+    # We stop waiting at the deadline and let in-flight requests finish in the
+    # background (each request already has its own timeout).
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {ex.submit(contextvars.copy_context().run, _crossref_one, doi, timeout):
                    (key, paper) for key, doi, paper in items}
         try:
-            for fut in as_completed(futures, timeout=max(0.5, deadline - time.monotonic())):
+            for fut in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
                 key, paper = futures[fut]
                 try:
                     record = fut.result()
@@ -300,6 +305,8 @@ def _run_crossref(items, cache, deadline, budget, missing=None):
                     missing.append((key, paper))
         except FuturesTimeout:
             pass
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     return len(items)
 
 
@@ -310,11 +317,14 @@ def _run_title_probes(items, cache, deadline, budget):
     workers = max(1, min(PROBE_WORKERS, len(items)))
     timeout = max(1.0, min(PROBE_TIMEOUT, deadline - time.monotonic()))
     failures = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    # Same hard-deadline rule as _run_crossref: return to the caller on time,
+    # while any request already on the wire finishes in the background.
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {ex.submit(contextvars.copy_context().run, _probe_title, title, timeout):
                    key for key, title in items}
         try:
-            for fut in as_completed(futures, timeout=max(0.5, deadline - time.monotonic())):
+            for fut in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
                 key = futures[fut]
                 try:
                     record = fut.result()
@@ -330,6 +340,8 @@ def _run_title_probes(items, cache, deadline, budget):
                 cache[key] = record
         except FuturesTimeout:
             pass
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     if failures:
         print(f"      [warn] {len(failures)}/{len(items)} title probes failed "
               f"(e.g. {failures[0]}); they will be retried next run")

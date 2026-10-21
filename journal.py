@@ -85,6 +85,8 @@ _CONFERENCE_RE = re.compile(
     r"meeting of the|^proc\.|neurips|nips|icml|iclr|cvpr|iccv|eccv|aaai|ijcai|"
     r"acl\b|emnlp|naacl|coling|sigir|kdd|www\b|chi\b|ubicomp|sigcomm|"
     r"^cs\.|^cond-mat|^math\.|^q-bio|^physics\.|^stat\.|^eess\.|^econ\.", re.I)
+# PNAS publishes "Proceedings ..." but it is a journal, not a conference.
+_PNAS_RE = re.compile(r"^proceedings of the national academy of sciences\b|^pnas\b", re.I)
 
 _WS_RE = re.compile(r"[^a-z0-9]+")
 # Google Scholar (SerpAPI) hands the venue back exactly as Google renders it, and
@@ -114,6 +116,8 @@ def kind_of(venue):
         return "unknown"
     if _PREPRINT_RE.search(v):
         return "preprint"
+    if _PNAS_RE.search(v):
+        return "journal"
     if _CONFERENCE_RE.search(v):
         return "conference"
     return "journal"
@@ -124,6 +128,9 @@ def flagship_of(venue):
     if not n:
         return False, False
     if n in FLAGSHIP:
+        return True, False
+    if n.startswith("proceedings of the national academy of sciences"):
+        # The official name often carries "of the United States of America".
         return True, False
     for pre in SUB_PREFIXES:
         if n.startswith(pre) and n != pre:

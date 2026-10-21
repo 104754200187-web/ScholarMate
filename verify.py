@@ -290,12 +290,15 @@ def llm_check(answer, papers):
                 continue
             if n not in batch:
                 continue
-            ok = bool(v.get("supported"))
+            judged = isinstance(v.get("supported"), bool)
+            ok = bool(v.get("supported")) if judged else False
             reason = str(v.get("reason", "")).strip()
             title = papers[n - 1]["title"]
             lines.append((
-                "ok" if ok else "bad",
-                f"[{n}] LLM: claim {'supported' if ok else 'NOT supported'} by -> {title} | {reason}",
+                "ok" if ok else ("warn" if not judged else "bad"),
+                f"[{n}] LLM: claim "
+                f"{'supported' if ok else ('UNJUDGED' if not judged else 'NOT supported')}"
+                f" by -> {title} | {reason}",
             ))
     return lines
 
@@ -303,7 +306,8 @@ def llm_check(answer, papers):
 def llm_report(answer, papers):
     lines = llm_check(answer, papers)
     return ["--- LLM citation verification (DeepSeek) ---"] + [
-        f"{'OK ' if status == 'ok' else 'BAD'} {msg}" for status, msg in lines
+        f"{'OK ' if status == 'ok' else ('WARN' if status == 'warn' else 'BAD')} {msg}"
+        for status, msg in lines
     ]
 
 
@@ -342,13 +346,17 @@ def llm_audit(answer, papers):
                 continue
             if n not in batch:
                 continue
-            ok = bool(v.get("supported"))
+            judged = isinstance(v.get("supported"), bool)
+            ok = bool(v.get("supported")) if judged else False
             reason = str(v.get("reason", "")).strip()
             title = papers[n - 1]["title"]
-            verdicts.append({"n": n, "supported": ok, "reason": reason, "title": title})
+            verdicts.append({"n": n, "supported": ok, "judged": judged,
+                             "reason": reason, "title": title})
             lines.append((
-                "ok" if ok else "bad",
-                f"[{n}] LLM: claim {'supported' if ok else 'NOT supported'} by -> {title} | {reason}",
+                "ok" if ok else ("warn" if not judged else "bad"),
+                f"[{n}] LLM: claim "
+                f"{'supported' if ok else ('UNJUDGED' if not judged else 'NOT supported')}"
+                f" by -> {title} | {reason}",
             ))
     return {"lines": lines, "verdicts": verdicts}
 

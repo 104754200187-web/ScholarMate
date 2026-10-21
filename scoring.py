@@ -36,6 +36,7 @@ import llm
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.environ.get("SCORING_SETTINGS") or os.path.join(
     BASE_DIR, "outputs", "scoring_weights.json")
+OWNER_RE = re.compile(r"^[0-9a-f]{32}$")
 
 # how many papers one LLM call scores, and how many papers we are willing to
 # score in a single run (search mode can return 90+ papers; scoring all of them
@@ -182,11 +183,20 @@ def normalize_weights(weights, target_species=""):
     return out
 
 
-def load_settings():
+def settings_path(owner=None):
+    """Per-browser settings file when `owner` is a valid anonymous token."""
+    owner = str(owner or "").strip().lower()
+    if OWNER_RE.fullmatch(owner):
+        return os.path.join(os.path.dirname(SETTINGS_PATH),
+                            f"scoring-{owner}.json")
+    return SETTINGS_PATH
+
+
+def load_settings(owner=None):
     """Persisted defaults: {"weights": {...}, "target_species": "..."}."""
     settings = {"weights": default_weights(), "target_species": "", "preset": "balanced"}
     try:
-        with open(SETTINGS_PATH, encoding="utf-8") as f:
+        with open(settings_path(owner), encoding="utf-8") as f:
             saved = json.load(f)
     except (OSError, ValueError):
         return settings
@@ -197,13 +207,14 @@ def load_settings():
     return settings
 
 
-def save_settings(weights, target_species="", preset="custom"):
+def save_settings(weights, target_species="", preset="custom", owner=None):
     with _lock:
         data = {"weights": normalize_weights(weights, target_species),
                 "target_species": (target_species or "").strip(),
                 "preset": preset}
-        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
-        atomicio.write_json(SETTINGS_PATH, data, indent=1)
+        path = settings_path(owner)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        atomicio.write_json(path, data, indent=1)
     return data
 
 
