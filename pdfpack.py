@@ -20,6 +20,7 @@ import re
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 import exports
 import fulltext
@@ -79,11 +80,41 @@ def _arxiv_from_doi(paper):
 _doi_key = fulltext.doi_key
 
 
-def _fetch(url):
+def _fetch(url, max_bytes=None):
     """One attempt per URL: a batch cannot spend the budget on retries."""
     fulltext._arxiv_wait(url)
     return fulltext._http_get(url, timeout=TIMEOUT, retries=1,
-                              max_bytes=MAX_FILE_BYTES)
+                              max_bytes=max_bytes or MAX_FILE_BYTES)
+
+
+class _ByteBudget:
+    """Thread-safe reservation for bytes held by parallel PDF downloads.
+
+    A worker reserves the largest possible response before it starts, then
+    settles the reservation to the bytes it actually keeps. Reserving first is
+    what bounds the *inflight* total too: checking only after every download has
+    finished would let four 40 MB responses sit in memory before the ZIP cap is
+    applied.
+    """
+
+    def __init__(self, limit):
+        self.limit = max(0, int(limit))
+        self.left = self.limit
+        self.lock = Lock()
+
+    def reserve(self, size):
+        with self.lock:
+            taken = min(max(0, int(size)), self.left)
+            self.left -= taken
+            return taken
+
+    def release(self, size):
+        with self.lock:
+            self.left = min(self.limit, self.left + max(0, int(size)))
+
+    def settle(self, reserved, actual):
+        """Keep `actual` bytes reserved and return the unused part."""
+        self.release(max(0, int(reserved) - int(actual)))
 
 
 def download_papers(papers, should_cancel=None, oa=None):
@@ -95,6 +126,7 @@ def download_papers(papers, should_cancel=None, oa=None):
     """
     oa = {} if oa is None else oa
     deadline = time.monotonic() + BUDGET_S
+    budget = _ByteBudget(MAX_TOTAL_BYTES)
 
     def not_attempted(idx, paper, note):
         return {"index": idx, "paper": paper, "ok": False, "note": note,
@@ -123,7 +155,7 @@ def download_papers(papers, should_cancel=None, oa=None):
                     "note": "没有公开 PDF 链接（需在出版商处获取）",
                     "attempted": False}
         first_url = queue[0][0]
-        failures, seen, attempts = [], set(), 0
+        failures, seen, attempts, oversized = [], set(), 0, False
         while queue and attempts < MAX_ATTEMPTS:
             url, via = queue.pop(0)
             if not url or url in seen:
@@ -135,21 +167,42 @@ def download_papers(papers, should_cancel=None, oa=None):
                         "；".join(failures) + f"（已尝试 {attempts} 次，时间上限内未取到）")
                 return not_attempted(idx, paper, note)
             attempts += 1
+            reserved = budget.reserve(MAX_FILE_BYTES)
+            if not reserved:
+                out = not_attempted(
+                    idx, paper,
+                    f"超出打包合计体积上限（>{MAX_TOTAL_BYTES / 1e6:.0f} MB），未尝试下载")
+                out["oversized"] = True
+                return out
             try:
-                data = _fetch(url)
+                data = _fetch(url, max_bytes=reserved)
             except Exception as e:
+                budget.release(reserved)
                 failures.append(f"{via}下载失败：{e}")
+                if "too large" in str(e).lower():
+                    oversized = True
                 continue
+            size = len(data)
             if fulltext.looks_like_pdf(data):
+                if size > MAX_FILE_BYTES:
+                    budget.release(reserved)
+                    failures.append(f"{via}超过单篇体积上限")
+                    oversized = True
+                    continue
+                budget.settle(reserved, size)
                 return {"index": idx, "paper": paper, "ok": True, "data": data,
                         "url": url, "via": via, "attempted": True}
             # a landing page: the PDF it advertises gets tried first
+            budget.release(reserved)
             inner = fulltext.pdf_link_from_html(data, url)
             if inner and inner not in seen:
                 queue.insert(0, (inner, "落地页内的 PDF 链接"))
             failures.append(f"{via}返回的不是 PDF（可能是落地页）")
-        return {"index": idx, "paper": paper, "ok": False,
-                "note": "；".join(failures), "url": first_url, "attempted": True}
+        out = {"index": idx, "paper": paper, "ok": False,
+               "note": "；".join(failures), "url": first_url, "attempted": True}
+        if oversized:
+            out["oversized"] = True
+        return out
 
     items = [(i, p) for i, p in enumerate(papers, 1)]
     if not items:
@@ -205,13 +258,15 @@ def build_zip(papers, store=None, question="", run_id=""):
     papers = list(papers)[:MAX_PAPERS]
     oa = search.openalex_oa_pdf_urls(papers)
     results = download_papers(papers, oa=oa)
-    packed, total, oversized = set(), 0, []
+    packed, total = set(), 0
+    oversized = [r["index"] for r in results if r.get("oversized")]
     for r in results:
         if not r["ok"]:
             continue
         size = len(r["data"])
         if size > MAX_FILE_BYTES or total + size > MAX_TOTAL_BYTES:
-            oversized.append(r["index"])
+            if r["index"] not in oversized:
+                oversized.append(r["index"])
             r["note"] = (f"超出打包体积上限（单篇 >{MAX_FILE_BYTES / 1e6:.0f} MB"
                          f" 或合计 >{MAX_TOTAL_BYTES / 1e6:.0f} MB），未打包，可用链接单独下载")
             continue

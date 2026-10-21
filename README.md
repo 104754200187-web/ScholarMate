@@ -61,7 +61,7 @@
 | | 安全边界 | 严格 run id 与 owner 校验、请求体上限、下载 URL/重定向校验、前端链接白名单、CSV 公式注入防护 | `web.py` / `fulltext.py` / `exports.py` |
 | | 任务租约 | SQLite 任务表记录 `worker(host:pid)` 与心跳；重启只结算已退出/失联实例的任务 | `jobstore.py` |
 | | 离线评测 | 检索 Recall@K 金标准回归 + 快照质量汇总 | `eval.py` |
-| | 测试 | `tests/` 纳入版本管理：23 个离线套件 + 7 个 stdlib unittest | `tests/` |
+| | 测试 | `tests/` 纳入版本管理：24 个离线套件 + 7 个 stdlib unittest | `tests/` |
 | | 接口 | `/ask`、`/chat`、`/status`、`/history`、`/history/<id>`、`/graph`、`/citegraph`、`/poolgraph`、`/paperinfo`、`/screening`、`/export`、`/pdfpack` | `web.py` |
 
 ## 一、整体管线（LangGraph 节点）
@@ -521,7 +521,7 @@ Web 使用要点：
 python3 eval.py --data eval_data/gold.jsonl          # 检索 Recall@20 vs 金标准
 python3 eval.py --mode snapshot --snapshots outputs/history   # 快照质量汇总
 python3 -m unittest discover -s tests -v                       # stdlib 单元测试
-python3 -m tests.run_offline                                   # 23 个离线套件
+python3 -m tests.run_offline                                   # 24 个离线套件
 ```
 
 ## 六、模块结构

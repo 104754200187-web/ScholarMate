@@ -493,13 +493,15 @@ def _normalize_doi(text):
     return doi if _looks_like_doi(doi) else ""
 
 
-def _by_dois(dois, workers=4):
+def _by_dois(dois, workers=4, failures=None):
     """Several DOIs -> {doi_lower: node}, one OR-filter request per 50.
 
     This is what keeps a twenty-paper graph as cheap as a two-paper one. It also
     repairs itself: a DOI the batch did not return (odd characters, a record
     OpenAlex has dropped) is asked for on its own, in parallel and bounded, so a
-    single bad entry cannot leave a hole in the picture.
+    single bad entry cannot leave a hole in the picture. ``failures`` optionally
+    collects request errors so the caller can warn about an incomplete graph
+    instead of presenting a failed request as a paper that does not exist.
     """
     dois = [d for d in dict.fromkeys(dois) if d]
     if not dois:
@@ -512,7 +514,15 @@ def _by_dois(dois, workers=4):
             data = _get(WORKS_URL, {"filter": "doi:" + "|".join(chunk),
                                     "per-page": min(200, max(BATCH, len(chunk))),
                                     "select": SELECT})
-        except Exception:
+        except urllib.error.HTTPError as e:
+            # 400/404 is an answer: a malformed DOI or a deleted record. Every
+            # other status means the lookup did not complete.
+            if e.code not in (400, 404) and failures is not None:
+                failures.append(f"batch HTTP {e.code}")
+            return []
+        except Exception as e:
+            if failures is not None:
+                failures.append(str(e) or type(e).__name__)
             return []
         return data.get("results") or []
 
@@ -533,7 +543,13 @@ def _by_dois(dois, workers=4):
         def solo(doi):
             try:
                 node = _work_by_doi(doi)
-            except Exception:
+            except urllib.error.HTTPError as e:
+                if e.code not in (400, 404) and failures is not None:
+                    failures.append(f"DOI {doi}: HTTP {e.code}")
+                return None
+            except Exception as e:
+                if failures is not None:
+                    failures.append(f"DOI {doi}: {str(e) or type(e).__name__}")
                 return None
             return (doi.lower(), node) if node else None
 
@@ -790,8 +806,9 @@ def build_pool(papers, max_pool=POOL_MAX, min_shared=POOL_MIN_SHARED,
     # the reader's browser already sent -- so they run together rather than in
     # line.
     payload_dois = [d for d in (_normalize_doi(p.get("doi")) for p in candidates) if d]
+    lookup_failures = []
     with ThreadPoolExecutor(max_workers=2) as par:
-        f_meta = par.submit(_by_dois, payload_dois)
+        f_meta = par.submit(_by_dois, payload_dois, failures=lookup_failures)
         f_refs = par.submit(_s2_refs, [s2_id for _, s2_id, _ in handles])
         by_doi, s2 = f_meta.result(), f_refs.result()
 
@@ -804,7 +821,7 @@ def build_pool(papers, max_pool=POOL_MAX, min_shared=POOL_MIN_SHARED,
         if info.get("doi") and info["doi"] not in by_doi:
             recovered.append(info["doi"])
     if recovered:
-        by_doi.update(_by_dois(recovered))
+        by_doi.update(_by_dois(recovered, failures=lookup_failures))
 
     pool, refmap = [], {}
     for index, s2_id, doi in handles:
@@ -823,13 +840,23 @@ def build_pool(papers, max_pool=POOL_MAX, min_shared=POOL_MIN_SHARED,
     from_s2 = len(refmap)
     dropped = len(handles) - len(pool)
     if dropped:
-        warnings.append(f"{dropped} 篇在 OpenAlex 里没有匹配到（或已被删除），没有画进图里")
+        if lookup_failures:
+            warnings.append(f"{dropped} 篇没有画进图里；其中可能有 OpenAlex 查询失败，"
+                            f"不能据此判定论文不存在")
+        else:
+            warnings.append(f"{dropped} 篇在 OpenAlex 里没有匹配到（或已被删除），没有画进图里")
+    if lookup_failures:
+        warnings.append(f"OpenAlex DOI 查询有 {len(lookup_failures)} 次失败，图谱可能不完整")
     if no_id:
         warnings.append(f"{no_id} 篇既没有 DOI 也没有 arXiv 号，无法定位")
     if truncated:
         warnings.append(f"本轮论文超过图上限，只画了前 {max_pool} 篇"
                         f"（另有 {truncated} 篇没画进来）")
     if len(pool) < 2:
+        if lookup_failures:
+            raise GraphError(
+                f"OpenAlex DOI 查询失败 {len(lookup_failures)} 次，无法确认这些论文是否存在；"
+                f"请稍后重试")
         raise LookupError("匹配到的论文不足 2 篇，画不出关系图：换个检索词，"
                           "或对单篇用卡片上的「🕸 关系图谱」")
 
@@ -886,7 +913,11 @@ def build_pool(papers, max_pool=POOL_MAX, min_shared=POOL_MIN_SHARED,
     # only DOI-keyed references can be drawn; the rest still count towards
     # coupling but cannot be shown as a node.
     want = [k[4:] for _, k in shared if k.startswith("doi:")][:max_foundation]
-    foundation = list(_by_dois(want).values())
+    foundation_failures = []
+    foundation = list(_by_dois(want, failures=foundation_failures).values())
+    if foundation_failures:
+        warnings.append(f"共同奠基文献有 {len(foundation_failures)} 次 DOI 查询失败，"
+                        f"图中可能缺少部分奠基论文")
     key_of = lambda node: "doi:" + (node["doi"] or "").lower()
     for node in foundation:
         node["role"] = "prior"
@@ -977,6 +1008,7 @@ def build_pool(papers, max_pool=POOL_MAX, min_shared=POOL_MIN_SHARED,
             "refs_s2": from_s2, "refs_openalex": from_oa,
             "refs_coverage": refs_coverage, "isolated_pool": isolated,
             "unresolved": dropped, "no_id": no_id, "truncated": truncated,
+            "lookup_failures": len(lookup_failures) + len(foundation_failures),
             "warnings": warnings,
             "seconds": round(time.time() - t0, 1),
         },

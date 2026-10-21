@@ -869,7 +869,10 @@ def _read_one(key, path, url):
     """
     data, err = _download(key, url)
     if err:
-        _mark_skip(key, err, url=url)
+        # Running out of time says nothing about the URL: tomorrow's run must
+        # be allowed to try it again. Terminal failures are remembered below.
+        if "deadline reached" not in err:
+            _mark_skip(key, err, url=url)
         return "", err
     if not looks_like_pdf(data):
         # publishers hand a bot a landing page: the PDF is the link it carries
