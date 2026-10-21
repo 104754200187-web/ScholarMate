@@ -14,6 +14,7 @@ Snapshots are saved under outputs/history/*.json so results survive restarts.
 
 import argparse
 import base64
+import contextlib
 import contextvars
 import datetime
 import io
@@ -34,6 +35,7 @@ import exports
 import graph
 import jobstore
 import journal
+import llm
 import pdfpack
 import rerank
 import scoring
@@ -51,7 +53,7 @@ MAX_CONNECTIONS = int(os.environ.get("WEB_MAX_CONNECTIONS", "128"))
 # How many runs execute at the same time in this process. One by default, which
 # means a second visitor's run waits in the queue for the whole duration of the
 # first one -- a deliberate default, because every run also spends external
-# quota (DeepSeek / Semantic Scholar / SerpAPI) and the sources share one
+# quota (LLM / Semantic Scholar / SerpAPI) and the sources share one
 # circuit-breaker table. The task table already hands each run to exactly one
 # worker (`claim_next()`), so raising this just adds claimers.
 CONCURRENCY = max(1, int(os.environ.get("WEB_CONCURRENCY", "1")))
@@ -63,6 +65,12 @@ CONCURRENCY = max(1, int(os.environ.get("WEB_CONCURRENCY", "1")))
 # would claim from.
 _active = {}
 _active_lock = threading.Lock()
+# User LLM keys live here only while their jobs are queued/running. They are
+# deliberately not part of the job dict passed to jobstore, which persists
+# every non-underscore key. A restart therefore loses the keys, and the worker
+# fails that job loudly instead of spending the server's own quota.
+_job_llm = {}
+_job_llm_lock = threading.Lock()
 _wake = threading.Event()       # the worker sleeps here instead of polling
 PROGRESS_FLUSH_S = float(os.environ.get("PROGRESS_FLUSH_S", "2"))
 
@@ -77,6 +85,16 @@ OWNER_RE = re.compile(r"^[0-9a-f]{32}$")
 # absolute paths, odd names in an old directory) must never reach a file path.
 RUN_ID_RE = re.compile(r"^\d{8}_\d{6}_\d{6}$")
 MAX_BODY_BYTES = int(os.environ.get("WEB_MAX_BODY_BYTES", "1048576"))
+LLM_CONFIG_HEADER = "X-LLM-Config"
+FREE_LLM_HEADER = "X-LLM-Free-Config"
+MAX_LLM_CONFIG_BYTES = 16384
+_LLM_REJECTED = object()
+FREE_LLM_DAILY_REQUESTS = max(0, int(os.environ.get("FREE_LLM_DAILY_REQUESTS", "5")))
+FREE_LLM_GLOBAL_DAILY_REQUESTS = max(
+    0, int(os.environ.get("FREE_LLM_GLOBAL_DAILY_REQUESTS", "50")))
+_free_llm_usage = {}
+_free_llm_global = {"day": "", "used": 0}
+_free_llm_lock = threading.Lock()
 
 # /citegraph, /poolgraph and /paperinfo spend external OpenAlex/S2 quota and
 # run synchronously. Limit each browser+endpoint per minute, and cap how many
@@ -117,6 +135,73 @@ class _BodyError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _decode_llm_config(raw):
+    """Decode one browser's base64 JSON LLM config, or return None."""
+    if not raw:
+        return None
+    if len(raw) > MAX_LLM_CONFIG_BYTES:
+        raise ValueError("模型配置过大")
+    try:
+        data = base64.b64decode(raw.encode("ascii"), validate=True)
+    except Exception:
+        raise ValueError("模型配置编码无效") from None
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except Exception:
+        raise ValueError("模型配置不是有效 JSON") from None
+    return llm.normalize_config(parsed, require_key=True)
+
+
+def _decode_free_llm(raw):
+    """Decode a free-tier choice and resolve the server-owned key."""
+    if not raw:
+        return None
+    if len(raw) > MAX_LLM_CONFIG_BYTES:
+        raise ValueError("免费体验配置过大")
+    try:
+        data = base64.b64decode(raw.encode("ascii"), validate=True)
+    except Exception:
+        raise ValueError("免费体验配置编码无效") from None
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except Exception:
+        raise ValueError("免费体验配置不是有效 JSON") from None
+    if not isinstance(parsed, dict):
+        raise ValueError("免费体验配置必须是 JSON 对象")
+    return llm.free_config_for(parsed.get("provider"), parsed.get("model"))
+
+
+def _free_llm_quota_ok(owner):
+    """Best-effort free-tier quota, shared by one process.
+
+    The per-owner cap stops one visitor from draining the server key; the
+    optional all-process cap bounds the total spend even if cookies are reset.
+    Both counters are in memory, so this is an abuse guard, not billing.
+    Returns None when allowed, otherwise a short reason code.
+    """
+    if FREE_LLM_DAILY_REQUESTS <= 0:
+        return "disabled"
+    day = datetime.date.today().isoformat()
+    key = (str(owner or ""), day)
+    with _free_llm_lock:
+        used = _free_llm_usage.get(key, 0)
+        if used >= FREE_LLM_DAILY_REQUESTS:
+            return "owner"
+        if _free_llm_global.get("day") != day:
+            _free_llm_global["day"] = day
+            _free_llm_global["used"] = 0
+        if (FREE_LLM_GLOBAL_DAILY_REQUESTS > 0
+                and _free_llm_global["used"] >= FREE_LLM_GLOBAL_DAILY_REQUESTS):
+            return "global"
+        _free_llm_usage[key] = used + 1
+        _free_llm_global["used"] += 1
+        if len(_free_llm_usage) > 4096:
+            for other in list(_free_llm_usage):
+                if other[1] != day:
+                    _free_llm_usage.pop(other, None)
+    return None
 
 
 def _valid_run_id(run_id):
@@ -172,11 +257,42 @@ def _live_job(jid):
         return _active.get(str(jid))
 
 
-def _enqueue(job, owner=None):
+def _remember_job_llm(job_id, config):
+    with _job_llm_lock:
+        _job_llm[str(job_id)] = dict(config)
+
+
+def _take_job_llm(job_id):
+    with _job_llm_lock:
+        return _job_llm.pop(str(job_id), None)
+
+
+def _forget_job_llm(job_id):
+    with _job_llm_lock:
+        _job_llm.pop(str(job_id), None)
+
+
+def _enqueue(job, owner=None, llm_config=None):
     """File a job under its owner in the task table, then nudge the worker."""
     if owner is not None:
         job["owner"] = owner
-    jobstore.save(job)
+    if llm_config:
+        # The marker is safe to persist; the key itself stays in _job_llm.
+        if llm_config.get("free_access"):
+            job["llm_free_config"] = {
+                "provider": llm_config["provider"],
+                "model": llm_config["model"],
+            }
+        else:
+            job["llm_user_config"] = True
+        job["llm_label"] = llm.config_label(llm_config)
+        _remember_job_llm(job["id"], llm_config)
+    try:
+        jobstore.save(job)
+    except Exception:
+        if llm_config:
+            _forget_job_llm(job["id"])
+        raise
     _wake.set()
 
 
@@ -737,11 +853,26 @@ def _worker():
         with _active_lock:
             _active[job["id"]] = job   # the live copy /status reads while it runs
         run_key = _run_key(job)
+        job_llm = _take_job_llm(job["id"])
         graph.begin_run(run_key)        # the pipeline looks up its own event by this
         try:
             if job.get("cancel"):        # stopped while it was still queued
                 job.update({"status": "cancelled", "stage": "⏹ 已停止（排队时被取消）"})
                 continue
+            if job.get("llm_free_config") and job_llm is None:
+                free = job["llm_free_config"]
+                try:
+                    job_llm = llm.free_config_for(free.get("provider"), free.get("model"))
+                except (RuntimeError, ValueError) as exc:
+                    raise RuntimeError(f"免费体验配置已失效：{exc}") from None
+            if job.get("llm_user_config") and job_llm is None:
+                raise RuntimeError(
+                    "本任务的用户 LLM 配置已随服务重启丢失。请重新提交；"
+                    "系统不会改用服务器自己的 API 额度。")
+            if job_llm is None and not llm.server_default_allowed():
+                raise RuntimeError(
+                    "本任务没有用户 LLM 配置。请在页面左上角的「模型与 API Key」中保存"
+                    "自己的配置后重新提交。")
             job.update({"status": "running", "stage": "排队中…",
                         "started_at": datetime.datetime.now().isoformat(timespec="seconds")})
             _touch(job, force=True)
@@ -759,34 +890,37 @@ def _worker():
             cancelled = False
             _log_token = _log_sink.set(tee)
             try:
-                try:
-                    result = (_run_explore_job(job, on_stage)
-                              if job.get("mode") == "explore"
-                              else _run_chat_job(job, on_stage)
-                              if job.get("mode") == "chat" else graph.run_full(
-                        job["question"], mode=job["mode"], sort=job["sort"],
-                        filters=job.get("filters"), on_stage=on_stage,
-                        deep_verify=job.get("deep_verify", True),
-                        score_evidence=job.get("score_evidence", False),
-                        weights=job.get("weights"), target_species=job.get("target_species", ""),
-                        screen_retractions=job.get("screen_retractions"),
-                        thread_id=run_key,
-                        resume=bool(job.get("resume_thread")),
-                        directions=job.get("directions"),
-                    ))
-                except graph.JobCancelled as e:
-                    # keep the checkpoint: the run can still be resumed, and the
-                    # snapshot tells the user how far it got before stopping
-                    cancelled = True
-                    state = graph.snapshot_state(run_key)
-                    with _active_lock:
-                        job.update({
-                            "status": "cancelled", "stage": "⏹ 已停止",
-                            "cancel_reason": str(e),
-                            "papers_done": len(state.get("papers") or []),
-                            "pool_size": len(state.get("pool") or {}),
-                            "rounds_done": state.get("rounds", 0),
-                        })
+                job_ctx = (llm.use_config(job_llm) if job_llm
+                           else contextlib.nullcontext())
+                with job_ctx:
+                    try:
+                        result = (_run_explore_job(job, on_stage)
+                                  if job.get("mode") == "explore"
+                                  else _run_chat_job(job, on_stage)
+                                  if job.get("mode") == "chat" else graph.run_full(
+                            job["question"], mode=job["mode"], sort=job["sort"],
+                            filters=job.get("filters"), on_stage=on_stage,
+                            deep_verify=job.get("deep_verify", True),
+                            score_evidence=job.get("score_evidence", False),
+                            weights=job.get("weights"), target_species=job.get("target_species", ""),
+                            screen_retractions=job.get("screen_retractions"),
+                            thread_id=run_key,
+                            resume=bool(job.get("resume_thread")),
+                            directions=job.get("directions"),
+                        ))
+                    except graph.JobCancelled as e:
+                        # keep the checkpoint: the run can still be resumed, and the
+                        # snapshot tells the user how far it got before stopping
+                        cancelled = True
+                        state = graph.snapshot_state(run_key)
+                        with _active_lock:
+                            job.update({
+                                "status": "cancelled", "stage": "⏹ 已停止",
+                                "cancel_reason": str(e),
+                                "papers_done": len(state.get("papers") or []),
+                                "pool_size": len(state.get("pool") or {}),
+                                "rounds_done": state.get("rounds", 0),
+                            })
             finally:
                 _log_sink.reset(_log_token)
             if cancelled:
@@ -899,6 +1033,30 @@ PAGE = """<!DOCTYPE html>
        color:var(--strong); text-shadow:0 0 30px rgba(79,140,255,.22); }
   h1 .brand2 { color:var(--accent); }
   #theme { position:absolute; top:24px; right:20px; }
+  /* Model settings live in a compact dock so the API key is available on
+     every page without taking space from the search-first layout. */
+  #llmpanel { position:fixed; top:16px; left:20px; z-index:80; width:max-content;
+              max-width:calc(100vw - 28px); margin:0;
+              box-shadow:0 12px 32px rgba(0,0,0,.28); }
+  #llmpanel:not([open]) { padding:0; }
+  #llmpanel:not([open]) > summary { padding:8px 11px; }
+  #llmpanel[open] { width:min(420px, calc(100vw - 28px));
+                    max-height:calc(100vh - 32px); overflow:auto; }
+  #llmpanel > summary { list-style:none; }
+  #llmpanel > summary::-webkit-details-marker { display:none; }
+  #llmsummary { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #llmpanel:not([open]) #llmsummary { max-width:160px; }
+  #llmmodal { position:fixed; inset:0; z-index:200; display:flex; align-items:center;
+              justify-content:center; padding:20px; background:rgba(5,8,14,.64);
+              backdrop-filter:blur(3px); }
+  #llmmodal[hidden] { display:none; }
+  .llmmodalcard { width:min(460px, 100%); padding:20px; border:1px solid var(--line2);
+                  border-radius:14px; background:var(--card);
+                  box-shadow:0 24px 70px rgba(0,0,0,.42); }
+  .llmmodalcard h2 { margin:0 0 8px; font-size:19px; color:var(--strong); }
+  .llmmodalcard p { margin:8px 0; color:var(--body); font-size:13.5px; }
+  .llmmodalactions { display:flex; justify-content:flex-end; gap:8px;
+                     flex-wrap:wrap; margin-top:16px; }
   .controls { background:var(--card); border:1px solid var(--line); border-radius:14px;
               padding:12px 14px; margin-bottom:14px; }
   .modes { display:inline-flex; gap:2px; padding:3px; margin-bottom:12px; font-size:13.5px;
@@ -914,7 +1072,10 @@ PAGE = """<!DOCTYPE html>
   .optrow + .optrow { margin-top:10px; }
   .optrow label { display:flex; align-items:center; gap:5px; cursor:pointer; }
   .optrow input[type=checkbox] { margin:0; accent-color:var(--accent); }
-  .optrow input[type=text] { background:var(--field); }
+  .optrow input[type=text], .optrow input[type=password] { background:var(--field); }
+  .llmform { display:flex; flex-direction:column; gap:10px; }
+  .llmform .optrow { flex-wrap:wrap; }
+  .llmform input { min-width:240px; }
   select { padding:7px 10px; border-radius:8px; border:1px solid var(--line2);
            background:var(--field); color:var(--fg); font-size:13.5px; outline:none; }
   #sorts { display:none; }
@@ -1142,9 +1303,12 @@ PAGE = """<!DOCTYPE html>
   #totop.show { opacity:1; pointer-events:auto; }
   #totop:hover { color:var(--fg); border-color:var(--accent); }
   @media (max-width:720px) {
-    main { padding:32px 14px 72px; }
+    main { padding:54px 14px 72px; }
     h1 { font-size:30px; margin:10px 0 22px; }
     #theme { top:14px; right:14px; }
+    #llmpanel { top:10px; left:10px; max-width:calc(100vw - 20px); }
+    #llmpanel[open] { width:calc(100vw - 20px); max-height:calc(100vh - 20px); }
+    #llmmodal { padding:12px; }
     form { flex-wrap:wrap; }
     form button { width:100%; }
     .optrow { gap:8px 12px; }
@@ -1188,7 +1352,7 @@ PAGE = """<!DOCTYPE html>
     :root { --bg:#fff; --card:#fff; --field:#fff; --sunk:#fafafa; --line:#ccc; --line2:#ccc;
             --fg:#000; --strong:#000; --body:#000; --muted:#555; --hover:transparent; }
     .controls, form, #progress, .bar, #chips, #totop, #history, #log,
-    .srow, .evbtn, .empty, #chatpanel { display:none !important; }
+    #llmpanel, #llmmodal, .srow, .evbtn, .empty, #chatpanel { display:none !important; }
     main { max-width:none; padding:0; min-height:0; display:block; }
     #answerbox p, #answerbox li, .claim { max-width:none; }
     .panel, .paper { break-inside:avoid; }
@@ -1261,6 +1425,76 @@ PAGE = """<!DOCTYPE html>
     <summary>⚖️ 证据评分权重（拖动滑杆即时保存，下次运行生效）</summary>
     <div id="scoringbody" class="meta">读取中…</div>
   </details>
+  <details class="panel" id="llmpanel">
+    <summary>🔑 模型与 API Key<span class="meta" id="llmsummary">未设置（提问前必须配置）</span></summary>
+    <div class="llmform">
+      <div class="optrow">
+        <label for="llmprovider">模型服务</label>
+        <select id="llmprovider">
+          <option value="deepseek">DeepSeek</option>
+          <option value="openai">OpenAI GPT</option>
+          <option value="anthropic">Anthropic Claude</option>
+          <option value="gemini">Google Gemini（有免费层）</option>
+          <option value="qwen">通义千问（DashScope）</option>
+          <option value="xai">xAI Grok</option>
+          <option value="mistral">Mistral AI</option>
+          <option value="moonshot">Moonshot Kimi</option>
+          <option value="zhipu">智谱 GLM（有免费层）</option>
+          <option value="doubao">字节豆包 Doubao</option>
+          <option value="baidu">百度文心 ERNIE（新用户额度）</option>
+          <option value="hunyuan">腾讯混元 Hunyuan（新用户额度）</option>
+          <option value="minimax">MiniMax</option>
+          <option value="groq">Groq（有免费层）</option>
+          <option value="openrouter">OpenRouter（有免费层）</option>
+          <option value="cohere">Cohere（免费试用）</option>
+          <option value="siliconflow">硅基流动 SiliconFlow</option>
+          <option value="custom">自定义 OpenAI 兼容服务</option>
+        </select>
+        <span class="meta">使用你自己的 API Key 和额度 ·
+          <a id="llmdoclink" href="https://api-docs.deepseek.com/" target="_blank"
+             rel="noopener noreferrer">官方调用文档</a></span>
+      </div>
+      <div class="optrow">
+        <label for="llmkey">API Key</label>
+        <input id="llmkey" type="password" autocomplete="new-password" spellcheck="false"
+               placeholder="粘贴你的 API Key（只保存在当前浏览器）" style="flex:1">
+      </div>
+      <div class="optrow">
+        <label for="llmmodel">模型</label>
+        <input id="llmmodel" type="text" list="llmmodels" spellcheck="false"
+               placeholder="模型名" style="flex:1">
+        <span class="meta" id="llmfreetag"></span>
+        <datalist id="llmmodels">
+          <option value="deepseek-flash"></option>
+          <option value="deepseek-v4-pro"></option>
+        </datalist>
+      </div>
+      <div class="optrow">
+        <span class="meta" id="llmfreehint">带「免费 / 试用」标记的模型可使用厂商免费额度；没有 Key 时可直接使用管理员配置的免费体验。</span>
+        <button type="button" id="llmfreeopen" class="ghost mini">免 Key 免费体验</button>
+      </div>
+      <div class="optrow" id="llmbasewrap" style="display:none">
+        <label for="llmbase">Base URL</label>
+        <input id="llmbase" type="text" spellcheck="false"
+               placeholder="https://gateway.example/v1" style="flex:1">
+      </div>
+      <div class="optrow" id="llmstylewrap" style="display:none">
+        <label for="llmstyle">接口风格</label>
+        <select id="llmstyle">
+          <option value="chat">Chat Completions（兼容性最好）</option>
+          <option value="responses">Responses API</option>
+        </select>
+      </div>
+      <div class="optrow">
+        <button type="button" id="llmsave">保存到本浏览器</button>
+        <button type="button" id="llmclear" class="ghost mini">清除</button>
+        <span class="meta" id="llmstatus"></span>
+      </div>
+      <p class="meta" style="margin:0">密钥保存在当前浏览器和当前访问地址的 localStorage，并随运行请求发送到此服务；
+        服务只在任务执行期间驻留内存，不写入任务库或历史快照。公共电脑请用后点「清除」；
+        生产部署必须放在 HTTPS 反向代理后，否则 key 会以明文经过网络。</p>
+    </div>
+  </details>
   <div class="bar" id="toolbar"></div>
   <div id="chips" class="chips"></div>
   <div id="answer"></div>
@@ -1277,6 +1511,27 @@ PAGE = """<!DOCTYPE html>
   <div id="ownerbar" class="panel" style="display:none;margin-bottom:14px"></div>
   <details class="panel" id="history"><summary>🕘 历史记录<span class="meta" id="histcount"></span></summary><div id="histlist" class="meta">展开后加载（仅显示本浏览器的记录）…</div></details>
 </main>
+<div id="llmmodal" hidden role="dialog" aria-modal="true"
+     aria-labelledby="llmmodaltitle" aria-describedby="llmmodaltext">
+  <div class="llmmodalcard">
+    <h2 id="llmmodaltitle">设置自己的模型，或使用免费体验</h2>
+    <p id="llmmodaltext">你可以点击左上角的「🔑 模型与 API Key」填写自己的 Key；
+      如果还没有 Key，可选择管理员开放的免费/试用模型。</p>
+    <div id="llmfreebox">
+      <p class="meta">免 Key 免费体验（每个浏览器每天有次数上限）：</p>
+      <div class="optrow">
+        <select id="llmfreeselect" style="flex:1"></select>
+        <button type="button" id="llmfreeuse">使用免费体验</button>
+      </div>
+      <p class="meta" id="llmfreestatus">正在检查可用的免费体验…</p>
+    </div>
+    <p class="meta">自己的 Key 只保存在当前浏览器；免费体验的 Key 只在服务端使用，不会下发到浏览器。</p>
+    <div class="llmmodalactions">
+      <button type="button" id="llmmodalgo">去设置</button>
+      <button type="button" id="llmmodalclose" class="ghost">稍后再说</button>
+    </div>
+  </div>
+</div>
 <button type="button" id="totop" title="回到顶部">↑</button>
 <script>
 const $ = id => document.getElementById(id);
@@ -1292,6 +1547,366 @@ let currentJobId = null; // job the ⏹ button would stop ("/cancel" target)
 // 所以按「属于哪套视图」归类，而不是按 payload 自己的 mode；谁最近被展示谁留在记忆里。
 const LAST_BY_MODE = {ask: null, search: null, explore: null};
 let runInFlight = false;  // 运行中不换视图：结果出来时 pollJob 自己会渲染
+
+// ---- per-browser LLM credentials -----------------------------------------
+// The key is stored only in this browser. Requests carry it in a dedicated
+// header; the server keeps it in memory for the task and never persists it.
+const LLM_STORE_KEY = "sm_llm_config_v1";
+const LLM_PRESETS = {
+  deepseek: {label: "DeepSeek", model: "deepseek-flash", style: "chat",
+             models: ["deepseek-flash", "deepseek-v4-pro"],
+             docs: "https://api-docs.deepseek.com/"},
+  openai: {label: "OpenAI GPT", model: "gpt-6.1-sol", style: "responses",
+           models: ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"],
+           docs: "https://platform.openai.com/docs/models"},
+  anthropic: {label: "Anthropic Claude", model: "claude-opus-5-5", style: "anthropic",
+              models: ["claude-opus-5-5", "claude-fable-5-1",
+                       "claude-sonnet-5-5", "claude-haiku-5-5"],
+              docs: "https://platform.claude.com/docs/en/get-started"},
+  gemini: {label: "Google Gemini", model: "gemini-3.8-flash", style: "gemini",
+           models: ["gemini-3.8-flash", "gemini-4-argon",
+                    "gemini-3.6-flash", "gemini-3.5-flash-lite"],
+           freeModels: ["gemini-3.8-flash", "gemini-3.5-flash-lite"],
+           docs: "https://ai.google.dev/gemini-api/docs/api-key"},
+  qwen: {label: "通义千问", model: "qwen-plus", style: "chat",
+         models: ["qwen-plus", "qwen-max", "qwen3.8-max",
+                  "qwen3.7-plus", "qwen3.8-flash"],
+         docs: "https://help.aliyun.com/zh/model-studio/get-api-key"},
+  xai: {label: "xAI Grok", model: "grok-4.7", style: "responses",
+        models: ["grok-4.7", "grok-4.20"],
+        docs: "https://docs.x.ai/docs/overview"},
+  mistral: {label: "Mistral AI", model: "mistral-large-4", style: "chat",
+            models: ["mistral-large-4", "mistral-medium-3-5", "mistral-small-latest"],
+            docs: "https://docs.mistral.ai/getting-started/quickstart"},
+  moonshot: {label: "Moonshot Kimi", model: "kimi-k3", style: "chat",
+             models: ["kimi-k3", "kimi-k2.6", "kimi-k2.7-code-highspeed"],
+             docs: "https://platform.moonshot.cn/docs/guide/start-using-kimi-api"},
+  zhipu: {label: "智谱 GLM", model: "glm-5.3", style: "chat",
+          models: ["glm-5.3", "glm-5.3-flash", "glm-5.2", "GLM-4.7-Flash",
+                   "GLM-4.5-Flash", "GLM-4-Flash-250414"],
+          freeModels: ["GLM-4.7-Flash", "GLM-4.5-Flash", "GLM-4-Flash-250414"],
+          docs: "https://docs.bigmodel.cn/cn/guide/develop/openai/introduction"},
+  doubao: {label: "字节豆包 Doubao", model: "doubao-seed-2-1-pro-260915", style: "chat",
+           models: ["doubao-seed-2-1-pro-260915", "doubao-seed-2-1-lite-260915",
+                    "doubao-seed-2-1-turbo-260628"],
+           docs: "https://www.volcengine.com/docs/82379/1298459"},
+  baidu: {label: "百度文心 ERNIE", model: "ERNIE-5.1", style: "chat",
+          models: ["ERNIE-5.1", "ERNIE-5.0", "ERNIE-5.0-Thinking-Latest",
+                   "ERNIE-5.0-Thinking-Preview", "ERNIE-4.5-Turbo-128K",
+                   "ERNIE-4.5-Turbo-32K"],
+          trialModels: ["ERNIE-4.5-Turbo-128K", "ERNIE-4.5-Turbo-32K"],
+          docs: "https://cloud.baidu.com/doc/qianfan/s/Hmh4suq26"},
+  hunyuan: {label: "腾讯混元 Hunyuan", model: "hunyuan-turbos-latest", style: "chat",
+            models: ["hunyuan-turbos-latest", "hunyuan-a13b"],
+            trialModels: ["hunyuan-a13b"],
+            docs: "https://cloud.tencent.com/document/product/1729/111007"},
+  minimax: {label: "MiniMax", model: "MiniMax-M3.1-Flash", style: "chat",
+            models: ["MiniMax-M3.1-Flash", "MiniMax-M3", "MiniMax-M2.7",
+                     "MiniMax-M2.7-highspeed"],
+            docs: "https://platform.minimaxi.com/docs/api-reference/text-openai-api"},
+  groq: {label: "Groq", model: "openai/gpt-oss-120b", style: "chat",
+         models: ["openai/gpt-oss-120b", "openai/gpt-oss-20b",
+                  "llama-3.3-70b-versatile", "qwen/qwen3.8-27b"],
+         freeModels: ["openai/gpt-oss-120b", "openai/gpt-oss-20b",
+                      "qwen/qwen3.8-27b"],
+         docs: "https://console.groq.com/docs/openai"},
+  openrouter: {label: "OpenRouter", model: "~openai/gpt-sol-latest", style: "chat",
+               models: ["~openai/gpt-sol-latest", "~anthropic/claude-sonnet-latest",
+                        "minimax/minimax-m3.1-flash:free",
+                        "google/gemma-4-26b-a4b-it:free",
+                        "google/gemma-4-31b-it:free"],
+               freeModels: ["minimax/minimax-m3.1-flash:free",
+                            "google/gemma-4-26b-a4b-it:free",
+                            "google/gemma-4-31b-it:free"],
+               docs: "https://openrouter.ai/docs/quickstart"},
+  cohere: {label: "Cohere", model: "command-a-plus-05-2026", style: "chat",
+           models: ["command-a-plus-05-2026", "command-a-03-2025",
+                    "command-a-reasoning-08-2025"],
+           trialModels: ["command-a-plus-05-2026", "command-a-03-2025",
+                         "command-a-reasoning-08-2025"],
+           docs: "https://docs.cohere.com/docs/compatibility-api"},
+  siliconflow: {label: "硅基流动 SiliconFlow", model: "deepseek-ai/DeepSeek-V4-Flash",
+                style: "chat",
+                models: ["deepseek-ai/DeepSeek-V4-Flash",
+                         "moonshotai/Kimi-K2.7-Code"],
+                docs: "https://docs.siliconflow.cn/cn/api-reference/chat-completions/chat-completions"},
+  custom: {label: "自定义服务", model: "", style: "chat", models: [], docs: ""},
+};
+let LLMCFG = null;
+let LLM_FREE = null;
+let LLM_FREE_OPTIONS = [];
+let LLM_FREE_LIMIT = 0;
+let LLM_FREE_GLOBAL_LIMIT = 0;
+let LLM_FREE_ENABLED = true;
+let LLM_FREE_LOADING = false;
+
+function llmReadStored() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LLM_STORE_KEY) || "null");
+    if (!raw || typeof raw !== "object"
+        || !Object.prototype.hasOwnProperty.call(LLM_PRESETS, raw.provider)) return null;
+    const apiKey = String(raw.api_key || "").trim();
+    if (!apiKey) return null;
+    return {
+      provider: raw.provider,
+      api_key: apiKey,
+      model: String(raw.model || LLM_PRESETS[raw.provider].model),
+      base_url: String(raw.base_url || ""),
+      api_style: String(raw.api_style || LLM_PRESETS[raw.provider].style),
+    };
+  } catch (e) { return null; }
+}
+
+function llmB64(text) {
+  if (typeof TextEncoder !== "undefined") {
+    const bytes = new TextEncoder().encode(text);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+  return btoa(unescape(encodeURIComponent(text)));
+}
+
+function llmHeaders(headers) {
+  const out = Object.assign({}, headers || {});
+  if (LLMCFG) out["X-LLM-Config"] = llmB64(JSON.stringify(LLMCFG));
+  else if (LLM_FREE) out["X-LLM-Free-Config"] = llmB64(JSON.stringify({
+    provider: LLM_FREE.provider, model: LLM_FREE.model,
+  }));
+  return out;
+}
+
+function llmRequire() {
+  if (LLMCFG || LLM_FREE) return true;
+  llmModalOpen();
+  return false;
+}
+
+function llmModalOpen() {
+  const modal = $("llmmodal");
+  if (!modal) return;
+  modal.hidden = false;
+  llmLoadFreeOptions();
+  const go = $("llmmodalgo");
+  if (go) go.focus();
+}
+
+function llmModalClose() {
+  const modal = $("llmmodal");
+  if (modal) modal.hidden = true;
+}
+
+function llmModalGo() {
+  llmModalClose();
+  const panel = $("llmpanel");
+  if (panel) panel.open = true;
+  const status = $("llmstatus");
+  if (status) status.textContent = "请填写 API Key 后保存";
+  const key = $("llmkey");
+  if (key) key.focus();
+}
+
+function llmFreeTagFor(provider, model) {
+  const preset = LLM_PRESETS[provider] || {};
+  if ((preset.freeModels || []).indexOf(model) >= 0) return "✅ 免费层";
+  if ((preset.trialModels || []).indexOf(model) >= 0) return "🎁 新用户赠送/试用";
+  return "";
+}
+
+function llmUpdateFreeTag() {
+  const tag = $("llmfreetag");
+  if (!tag) return;
+  tag.textContent = llmFreeTagFor($("llmprovider").value, $("llmmodel").value.trim());
+}
+
+function llmRenderFreeOptions() {
+  const select = $("llmfreeselect");
+  const use = $("llmfreeuse");
+  const status = $("llmfreestatus");
+  if (!select) return;
+  select.innerHTML = "";
+  LLM_FREE_OPTIONS.forEach((opt) => {
+    const option = document.createElement("option");
+    option.value = opt.provider;
+    option.textContent = opt.label + " · " + opt.model;
+    select.appendChild(option);
+  });
+  if (LLM_FREE) select.value = LLM_FREE.provider;
+  const available = LLM_FREE_OPTIONS.length > 0;
+  select.disabled = !available;
+  if (use) use.disabled = !available;
+  if (status) {
+    const globalText = LLM_FREE_GLOBAL_LIMIT > 0
+      ? "；全站每日共 " + LLM_FREE_GLOBAL_LIMIT + " 次" : "";
+    status.textContent = !LLM_FREE_ENABLED
+      ? "管理员已关闭免 Key 免费体验；请填写自己的 API Key。"
+      : (available
+         ? "每日 " + (LLM_FREE_LIMIT || 0) + " 次/浏览器" + globalText
+           + "；服务端 Key 不会下发到浏览器。"
+         : "管理员尚未配置免费体验 Key；请填写自己的 API Key。");
+  }
+}
+
+async function llmLoadFreeOptions() {
+  if (LLM_FREE_LOADING) return;
+  LLM_FREE_LOADING = true;
+  try {
+    const resp = await fetch("/free-llm", {cache: "no-store"});
+    const data = await resp.json();
+    LLM_FREE_OPTIONS = Array.isArray(data.options) ? data.options : [];
+    LLM_FREE_LIMIT = Number(data.daily_limit || 0);
+    LLM_FREE_GLOBAL_LIMIT = Number(data.global_daily_limit || 0);
+    LLM_FREE_ENABLED = data.enabled !== false;
+  } catch (e) {
+    LLM_FREE_OPTIONS = [];
+  }
+  LLM_FREE_LOADING = false;
+  llmRenderFreeOptions();
+}
+
+function llmFreeUse() {
+  const select = $("llmfreeselect");
+  if (!select) return;
+  const opt = LLM_FREE_OPTIONS.find((item) => item.provider === select.value);
+  if (!opt) {
+    $("llmfreestatus").textContent = "没有可用的免费体验模型。";
+    return;
+  }
+  LLM_FREE = {provider: opt.provider, model: opt.model, label: opt.label};
+  LLMCFG = null;
+  try { localStorage.removeItem(LLM_STORE_KEY); } catch (e) {}
+  llmModalClose();
+  llmSyncForm();
+  $("llmpanel").open = false;
+  $("llmstatus").textContent = "已选择免费体验，请再次提交";
+}
+
+function llmRefreshModels(provider) {
+  const list = $("llmmodels");
+  if (!list) return;
+  const preset = LLM_PRESETS[provider] || LLM_PRESETS.custom;
+  list.innerHTML = "";
+  const seen = {};
+  (preset.models || []).forEach((name) => {
+    if (!name || seen[name]) return;
+    seen[name] = true;
+    const option = document.createElement("option");
+    option.value = name;
+    const tag = llmFreeTagFor(provider, name);
+    option.label = tag ? name + "（" + tag.replace(/^[^\\s]+\\s/, "") + "）" : name;
+    list.appendChild(option);
+  });
+  const docs = $("llmdoclink");
+  if (docs) {
+    docs.href = preset.docs || "";
+    docs.style.display = preset.docs ? "" : "none";
+  }
+}
+
+function llmProviderChanged(resetFields) {
+  const provider = $("llmprovider").value;
+  const preset = LLM_PRESETS[provider] || LLM_PRESETS.custom;
+  const custom = provider === "custom";
+  $("llmbasewrap").style.display = custom ? "" : "none";
+  $("llmstylewrap").style.display = custom ? "" : "none";
+  $("llmmodel").placeholder = preset.model || "输入模型名";
+  llmRefreshModels(provider);
+  if (resetFields) {
+    $("llmmodel").value = preset.model;
+    $("llmbase").value = "";
+    $("llmstyle").value = preset.style;
+  }
+  llmUpdateFreeTag();
+  const status = $("llmstatus");
+  if (status && LLMCFG && LLMCFG.provider !== provider) {
+    status.textContent = "切换服务后请重新填写 API Key";
+  } else if (status) {
+    status.textContent = LLMCFG ? "已保存" : "";
+  }
+}
+
+function llmSyncForm() {
+  const provider = LLMCFG ? LLMCFG.provider
+    : (LLM_FREE ? LLM_FREE.provider : "deepseek");
+  const preset = LLM_PRESETS[provider] || LLM_PRESETS.deepseek;
+  $("llmprovider").value = provider;
+  $("llmmodel").value = LLMCFG ? LLMCFG.model
+    : (LLM_FREE ? LLM_FREE.model : preset.model);
+  $("llmbase").value = LLMCFG ? (LLMCFG.base_url || "") : "";
+  $("llmstyle").value = LLMCFG ? (LLMCFG.api_style || preset.style) : preset.style;
+  $("llmkey").value = "";
+  $("llmkey").placeholder = LLMCFG
+    ? "已保存；留空保持不变，粘贴新值可替换"
+    : (LLM_FREE ? "当前使用免费体验；填写自己的 Key 可替换"
+                : "粘贴你的 API Key（只保存在当前浏览器）");
+  $("llmsummary").textContent = LLMCFG
+    ? ((LLM_PRESETS[provider] || {}).label || provider) + " · " + LLMCFG.model + " · 已保存"
+    : (LLM_FREE ? "免费体验 · " + LLM_FREE.label + " · " + LLM_FREE.model
+                : "未设置（可用免费体验或填写 Key）");
+  llmProviderChanged(false);
+}
+
+function llmSave() {
+  const provider = $("llmprovider").value;
+  const preset = LLM_PRESETS[provider] || LLM_PRESETS.custom;
+  const typedKey = ($("llmkey").value || "").trim();
+  const model = ($("llmmodel").value || "").trim() || preset.model;
+  const base = provider === "custom" ? ($("llmbase").value || "").trim() : "";
+  const style = provider === "custom" ? $("llmstyle").value : preset.style;
+  const sameTarget = !!(LLMCFG && LLMCFG.provider === provider
+                        && (LLMCFG.base_url || "") === base);
+  if (!typedKey && !(sameTarget && LLMCFG.api_key)) {
+    $("llmstatus").textContent = "请填写 API Key";
+    return;
+  }
+  if (!model) {
+    $("llmstatus").textContent = "请填写模型名";
+    return;
+  }
+  if (provider === "custom" && !base) {
+    $("llmstatus").textContent = "自定义服务需要填写 Base URL";
+    return;
+  }
+  LLMCFG = {
+    provider: provider, api_key: typedKey || LLMCFG.api_key,
+    model: model, base_url: base, api_style: style,
+  };
+  LLM_FREE = null;
+  try {
+    localStorage.setItem(LLM_STORE_KEY, JSON.stringify(LLMCFG));
+  } catch (e) {
+    $("llmstatus").textContent = "浏览器禁止保存到 localStorage";
+    return;
+  }
+  llmSyncForm();
+  $("llmpanel").open = false;
+}
+
+function llmClear() {
+  try { localStorage.removeItem(LLM_STORE_KEY); } catch (e) {}
+  LLMCFG = null;
+  LLM_FREE = null;
+  llmSyncForm();
+  $("llmpanel").open = true;
+  $("llmstatus").textContent = "已清除";
+}
+
+LLMCFG = llmReadStored();
+$("llmprovider").addEventListener("change", () => llmProviderChanged(true));
+$("llmmodel").addEventListener("input", llmUpdateFreeTag);
+$("llmsave").addEventListener("click", llmSave);
+$("llmclear").addEventListener("click", llmClear);
+$("llmfreeopen").addEventListener("click", llmModalOpen);
+$("llmfreeuse").addEventListener("click", llmFreeUse);
+$("llmmodalgo").addEventListener("click", llmModalGo);
+$("llmmodalclose").addEventListener("click", llmModalClose);
+$("llmmodal").addEventListener("click", (e) => {
+  if (e.target === $("llmmodal")) llmModalClose();
+});
+llmSyncForm();
+llmLoadFreeOptions();
+$("llmpanel").open = false;
+$("llmmodal").hidden = true;
 
 function setRunning(on) {
   runInFlight = !!on;
@@ -1691,6 +2306,7 @@ async function sendChat() {
   if (!box || !btn || !current || chatJob) return;
   const text = (box.value || "").trim();
   if (!text) { box.focus(); return; }
+  if (!llmRequire()) return;
   box.value = "";
   CHAT.push({role: "user", content: text});
   renderChatLog();
@@ -1698,7 +2314,7 @@ async function sendChat() {
   setChatHint('⏳ ScholarMate 正在读这批论文作答… <button type="button" class="ghost mini" onclick="stopChat()">⏹ 停止</button>');
   try {
     const fetchBox = $("chatfetch");
-    const r = await fetch("/chat", {method: "POST", headers: {"Content-Type": "application/json"},
+    const r = await fetch("/chat", {method: "POST", headers: llmHeaders({"Content-Type": "application/json"}),
                                     body: JSON.stringify({id: current.id, message: text,
                                                           allow_retrieve: fetchBox ? !!fetchBox.checked : true})});
     const j = await r.json().catch(() => ({}));
@@ -2945,11 +3561,12 @@ function applyLocalSort() {
 
 async function rerankCurrent() {
   if (!current) return;
+  if (!llmRequire()) return;
   btn.disabled = true;
   progress.classList.add("visible");
   stage.textContent = "对当前 " + current.papers.length + " 篇论文重新打相关性分（不重新检索）…";
   try {
-    const resp = await fetch("/rerank", {method:"POST", headers:{"Content-Type":"application/json"},
+    const resp = await fetch("/rerank", {method:"POST", headers:llmHeaders({"Content-Type":"application/json"}),
                                          body: JSON.stringify({id: current.id})});
     const j = await resp.json();
     if (j.error) throw new Error(j.error);
@@ -3229,11 +3846,12 @@ function exploreToggle(i) {
 }
 
 async function exploreSend(action, extra) {
+  if (!llmRequire()) throw new Error("请先在左上角「模型与 API Key」中保存自己的配置");
   const body = Object.assign({
     action: action, id: EXPLORE.runId, topic: EXPLORE.topic,
     path: EXPLORE.path, seen: EXPLORE.seen,
   }, extra || {});
-  const r = await fetch("/explore", {method: "POST", headers: {"Content-Type": "application/json"},
+  const r = await fetch("/explore", {method: "POST", headers: llmHeaders({"Content-Type": "application/json"}),
                                      body: JSON.stringify(body)});
   const j = await r.json().catch(() => ({}));
   if (!r.ok || !j.id) throw new Error(j.error || "无法开始探索");
@@ -3880,9 +4498,10 @@ function resumeButton(id) {
 }
 
 async function resumeJob(id, btnEl) {
+  if (!llmRequire()) return;
   btnEl.disabled = true;
   try {
-    const r = await fetch("/resume", {method: "POST", headers: {"Content-Type": "application/json"},
+    const r = await fetch("/resume", {method: "POST", headers: llmHeaders({"Content-Type": "application/json"}),
                                       body: JSON.stringify({id})});
     const rj = await r.json();
     if (rj.error) throw new Error(rj.error);
@@ -3906,6 +4525,7 @@ form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const question = q.value.trim();
   if (!question) return;
+  if (!llmRequire()) return;
   btn.disabled = true;
   answerBox.innerHTML = "";
   setEmptyVisible(false);
@@ -3926,7 +4546,7 @@ form.addEventListener("submit", async (e) => {
                 screen_retractions: mode === "search" ? $("retraction").checked : null,
                 target_species: mode === "ask" ? (($("species") || {}).value || "") : ""};
   try {
-    const resp = await fetch("/ask", {method:"POST", headers:{"Content-Type":"application/json"},
+    const resp = await fetch("/ask", {method:"POST", headers:llmHeaders({"Content-Type":"application/json"}),
                                       body: JSON.stringify(body)});
     const j = await resp.json();
     if (j.error) throw new Error(j.error);
@@ -3997,6 +4617,12 @@ if ($("theme")) {
 
 // ---- 键盘流：读了太多 PDF 的人不会想去点鼠标
 document.addEventListener("keydown", (e) => {
+  const modal = $("llmmodal");
+  if (modal && !modal.hidden && e.key === "Escape") {
+    e.preventDefault();
+    llmModalClose();
+    return;
+  }
   const tag = (document.activeElement || {}).tagName || "";
   const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
   if (e.key === "/" && !typing) { e.preventDefault(); q.focus(); return; }
@@ -4034,6 +4660,53 @@ class Handler(BaseHTTPRequestHandler):
             self._owner = owner
             self._owner_is_new = True
         return owner
+
+    def _llm_for_request(self):
+        """Decode this request's browser-held LLM config.
+
+        A browser may send either its own key or an allow-listed free-tier
+        choice. Returns None when the server's ordinary default is explicitly
+        allowed, or a private sentinel after an error response was sent.
+        """
+        user_raw = self.headers.get(LLM_CONFIG_HEADER)
+        free_raw = self.headers.get(FREE_LLM_HEADER)
+        try:
+            if user_raw:
+                config = _decode_llm_config(user_raw)
+            elif free_raw:
+                config = _decode_free_llm(free_raw)
+            else:
+                config = None
+        except RuntimeError as exc:
+            self._send(503, "application/json", json.dumps(
+                {"error": f"免费体验暂不可用：{exc}"}, ensure_ascii=False).encode("utf-8"))
+            return _LLM_REJECTED
+        except ValueError as exc:
+            self._send(400, "application/json", json.dumps(
+                {"error": f"模型配置无效：{exc}"}, ensure_ascii=False).encode("utf-8"))
+            return _LLM_REJECTED
+        if config is not None and config.get("free_access"):
+            quota = _free_llm_quota_ok(self._identity())
+            if quota:
+                if quota == "global":
+                    message = ("今天全站的免费体验额度已用完。请明天再试，"
+                               "或在左上角填写你自己的 API Key。")
+                elif quota == "disabled":
+                    message = ("管理员已关闭免 Key 免费体验。"
+                               "请在左上角填写你自己的 API Key。")
+                else:
+                    message = ("今天的免费体验次数已用完。请明天再试，"
+                               "或在左上角填写你自己的 API Key。")
+                self._send(429, "application/json", json.dumps(
+                    {"error": message}, ensure_ascii=False).encode("utf-8"))
+                return _LLM_REJECTED
+        if config is None and not llm.server_default_allowed():
+            self._send(400, "application/json", json.dumps(
+                {"error": "请先点击左上角的「🔑 模型与 API Key」，保存自己的模型配置；"
+                          "没有 Key 时可在弹窗中选择免费体验（若管理员已配置）。"},
+                ensure_ascii=False).encode("utf-8"))
+            return _LLM_REJECTED
+        return config
 
     # No request here is a long poll: /ask answers 202 at once and the frontend
     # polls /status, so a socket that has stopped talking is a dead one. Without
@@ -4075,6 +4748,15 @@ class Handler(BaseHTTPRequestHandler):
                 "preset": saved.get("preset", "balanced"),
                 "grades": [{"min": g[0], "label": g[1], "cls": g[2]} for g in scoring.GRADES],
                 "max_papers": scoring.MAX_PAPERS,
+            }, ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+        elif self.path == "/free-llm":
+            free_enabled = FREE_LLM_DAILY_REQUESTS > 0
+            body = json.dumps({
+                "enabled": free_enabled,
+                "options": llm.free_options() if free_enabled else [],
+                "daily_limit": FREE_LLM_DAILY_REQUESTS,
+                "global_daily_limit": FREE_LLM_GLOBAL_DAILY_REQUESTS,
             }, ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
         elif self.path.startswith("/screening"):
@@ -4147,6 +4829,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, "application/json",
                        json.dumps({"error": "bad request"}).encode("utf-8"))
             return
+        llm_config = self._llm_for_request()
+        if llm_config is _LLM_REJECTED:
+            return
         try:
             question = payload.get("question", "").strip()
             mode = payload.get("mode", "ask")
@@ -4188,7 +4873,7 @@ class Handler(BaseHTTPRequestHandler):
             "weights": weights, "target_species": target_species,
             "status": "queued", "stage": "排队中…", "log": [], "stages": [],
         }
-        _enqueue(job, self._identity())
+        _enqueue(job, self._identity(), llm_config=llm_config)
         self._send(202, "application/json",
                    json.dumps({"id": job["id"], "status": "queued"}).encode("utf-8"))
 
@@ -4329,6 +5014,9 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             self._send(400, "application/json", b'{"error":"bad request"}')
             return
+        llm_config = self._llm_for_request()
+        if llm_config is _LLM_REJECTED:
+            return
         action = str(payload.get("action") or "scope").strip()
         if action not in ("scope", "deepen", "survey"):
             self._send(400, "application/json", json.dumps(
@@ -4371,7 +5059,7 @@ class Handler(BaseHTTPRequestHandler):
                 "directions": chosen[:12], "path": path,
                 "status": "queued", "stage": "排队中…", "log": [], "stages": [],
             }
-            _enqueue(job, self._identity())
+            _enqueue(job, self._identity(), llm_config=llm_config)
             self._send(202, "application/json", json.dumps(
                 {"id": job["id"], "run_id": job["id"], "mode": "survey", "status": "queued"},
                 ensure_ascii=False).encode("utf-8"))
@@ -4431,13 +5119,16 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 except OSError:
                     pass
-        _enqueue(job, self._identity())
+        _enqueue(job, self._identity(), llm_config=llm_config)
         self._send(202, "application/json", json.dumps(
             {"id": job["id"], "run_id": run_id, "mode": "explore", "status": "queued"},
             ensure_ascii=False).encode("utf-8"))
 
     def _resume(self, payload):
         """Queue a failed run again, continuing from its last checkpoint."""
+        llm_config = self._llm_for_request()
+        if llm_config is _LLM_REJECTED:
+            return
         jid = str((payload or {}).get("id") or "")
         old = _get_job(jid, self._identity())
         if old is None:
@@ -4458,7 +5149,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "screen_retractions")}
         job.update({"id": _job_id(), "thread_id": thread_id, "resume_thread": thread_id,
                     "status": "queued", "stage": "排队中…（断点续跑）", "log": [], "stages": []})
-        _enqueue(job, self._identity())
+        _enqueue(job, self._identity(), llm_config=llm_config)
         self._send(202, "application/json",
                    json.dumps({"id": job["id"], "status": "queued", "resumed": True},
                               ensure_ascii=False).encode("utf-8"))
@@ -4781,6 +5472,9 @@ def main():
                     self._send(409, "application/json", json.dumps(
                         {"error": "上一轮追问还在回答中"}, ensure_ascii=False).encode("utf-8"))
                     return
+                llm_config = self._llm_for_request()
+                if llm_config is _LLM_REJECTED:
+                    return
                 job_id = _job_id()
                 chat_job = {
                     "id": job_id, "thread_id": job_id, "run_id": rid,
@@ -4788,7 +5482,7 @@ def main():
                     "allow_retrieve": bool(payload.get("allow_retrieve", True)),
                     "status": "queued", "stage": "排队中…", "log": [], "stages": [],
                 }
-                _enqueue(chat_job, self._identity())
+                _enqueue(chat_job, self._identity(), llm_config=llm_config)
                 self._send(202, "application/json",
                            json.dumps({"id": job_id, "status": "queued"},
                                       ensure_ascii=False).encode("utf-8"))
@@ -4815,6 +5509,9 @@ def main():
             if self.path != "/rerank":
                 self._send(404, "text/plain; charset=utf-8", b"not found")
                 return
+            llm_config = self._llm_for_request()
+            if llm_config is _LLM_REJECTED:
+                return
             job = _get_job(jid, self._identity())
             if job is None or job.get("mode") != "search":
                 # result may only exist as a persisted snapshot (server restart)
@@ -4826,7 +5523,10 @@ def main():
                 self._send(400, "application/json",
                            json.dumps({"error": "no completed search result for this id"}).encode("utf-8"))
                 return
-            ok = _rerank_existing(job)
+            job_ctx = (llm.use_config(llm_config) if llm_config
+                       else contextlib.nullcontext())
+            with job_ctx:
+                ok = _rerank_existing(job)
             if not ok:
                 self._send(500, "application/json",
                            json.dumps({"error": job.get("rerank_error") or "rerank failed"}).encode("utf-8"))

@@ -1,6 +1,6 @@
 """Citation verification, two layers:
 1. Rules: every [n] must map to a retrieved paper and match its title.
-2. LLM (DeepSeek): judge whether each cited paper actually supports the
+2. LLM: judge whether each cited paper actually supports the
    attached claim (OpenScholar-style attribution check).
 
 Pure stdlib.
@@ -305,14 +305,14 @@ def llm_check(answer, papers):
 
 def llm_report(answer, papers):
     lines = llm_check(answer, papers)
-    return ["--- LLM citation verification (DeepSeek) ---"] + [
+    return ["--- LLM citation verification ---"] + [
         f"{'OK ' if status == 'ok' else ('WARN' if status == 'warn' else 'BAD')} {msg}"
         for status, msg in lines
     ]
 
 
 def llm_audit(answer, papers):
-    """Structured attribution audit (one DeepSeek pass, same prompts/log as
+    """Structured attribution audit (one LLM pass, same prompts/log as
     llm_check). Returns {"lines": [...], "verdicts": [{"n", "supported",
     "reason", "title"}]}."""
     cited = [n for n in extract_citations(answer) if 1 <= n <= len(papers)]

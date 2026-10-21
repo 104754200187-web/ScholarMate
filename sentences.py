@@ -53,7 +53,7 @@ EXTRA_EVIDENCE_BUDGET = 4  # global cap on full-text fetches for supporting-but-
 EXTRA_PER_CLAIM = 1        # at most one such fetch per claim (enough to prove full-text support)
 # The per-sentence stage is dominated by LLM calls (passage rerank per cited
 # paper, then the batch judgement). They are independent, so run them in
-# parallel; DeepSeek tolerates this comfortably at 4-5 in flight.
+# parallel; the model provider tolerates this comfortably at 4-5 in flight.
 EVIDENCE_WORKERS = int(os.environ.get("CLAIM_EVIDENCE_WORKERS", "4"))
 # Supplementary evidence search. Every claim is searched (it is what finds the
 # field's anchor papers -- measured: 43 papers the pool did not have, 17 of them

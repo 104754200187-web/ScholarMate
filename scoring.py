@@ -14,7 +14,7 @@ Two conventions keep the numbers unambiguous:
   * the weighted total folds risk in as (100 - score), so the total is always
     "higher is better" regardless of which dimensions a user turns up.
 
-Nine dimensions are judged by DeepSeek from the abstract; 影响力 is computed
+Nine dimensions are judged by the configured LLM from the abstract; 影响力 is computed
 locally from citation velocity and venue, so it needs no model call and cannot
 drift between runs. Contradictions are additionally detected *across* the
 result set in a second pass, because no single abstract can reveal that another

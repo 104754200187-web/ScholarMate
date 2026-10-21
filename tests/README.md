@@ -4,7 +4,7 @@
 
 ```bash
 python3 -m unittest discover -s tests -v   # 标准 unittest（stdlib）
-python3 -m tests.run_offline               # 21 个离线套件
+python3 -m tests.run_offline               # 23 个离线套件
 python3 -m tests.run_offline t_claims_unit # 只跑指定套件
 ```
 

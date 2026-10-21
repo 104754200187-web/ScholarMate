@@ -1,6 +1,6 @@
 # ScholarMate 📚
 
-一款 OpenScholar 风格的文献智能体：输入研究问题 → 多源检索论文 → LLM 生成带引用的回答 → 三层证据校验（规则 + DeepSeek 归因 + 逐句全文证据）→ 不足则迭代检索。编排层基于 **LangGraph**，检索/校验原语全部为纯 Python 标准库。
+一款 OpenScholar 风格的文献智能体：输入研究问题 → 多源检索论文 → LLM 生成带引用的回答 → 三层证据校验（规则 + LLM 归因 + 逐句全文证据）→ 不足则迭代检索。编排层基于 **LangGraph**，检索/校验原语全部为纯 Python 标准库。
 
 支持 **🤖 智能问答**、**📄 仅搜索论文** 与 **🔭 领域探索** 三种模式：读完回答还能**继续追问**（交互对话，不重新检索），以及排序、过滤、**筛选留痕（纳入/排除/待定 + 理由）**、**🕸 文献关系图谱**（把任意论文放回引用网络，或把整轮结果一次画成一张图）、文献导出、批量下载 PDF、运行快照与历史记录。
 
@@ -11,7 +11,7 @@
 | 模式 | 🤖 智能问答 | 检索 → 生成带 `[n]` 引用的综述 → 三层校验 → 证据不足自动迭代补检（`MAX_ROUNDS=3`） | `graph.py` |
 | | 📄 仅搜索论文 | 只出论文列表，不做校验、**不截断数量**（ask 模式保留相关性 top 20） | `graph.py` |
 | | ⚡ 快速模式 | 关掉逐句全文校验，跳过声明拆分/取证/判决（实测 174s → 34s 量级） | `sentences.py` / `web.py` |
-| | 🧭 查询规划 | DeepSeek 把问题拆成 2-3 条英文检索词，失败退回原问题 | `graph.py` / `llm.py` |
+| | 🧭 查询规划 | LLM 把问题拆成 2-3 条英文检索词，失败退回原问题 | `graph.py` / `llm.py` |
 | 检索 | 6 源并行 | Semantic Scholar + OpenAlex + Google Scholar(SerpAPI) + arXiv + PubMed/Europe PMC + Crossref | `search.py` |
 | | 数据源注册表 | 新增数据库只需写 `search_foo(query, limit)` 并 `register_source()`，自动进入并行合并、独立限速与统计 | `search.py` |
 | | 经典锚点检索（②b） | 首轮前 2 条检索词按被引量排序，捞回 ≥100 引的奠基工作（实测 ≥100 引论文 5 → 22 篇） | `search.py` |
@@ -48,6 +48,8 @@
 | | 对话留痕 | 追问经 LangGraph 的 `chat_answer → chat_verify` 支线执行，回答做规则层引用校验；每轮回答**追加进该次运行的快照**，刷新/重启后仍在 | `graph.py` / `web.py` |
 | | 运行快照 | 每次运行落 `outputs/history/*.json`（含排序/过滤/检索统计/审计/导出），历史跨重启保留；页尾「🕘 历史记录」为可折叠面板，展开才拉取、展开状态浏览器记忆；**每条记录自带「⬇ 导出」，不点「查看」也能直接下载任一格式** | `web.py` |
 | | 运行归属（按浏览器隔离） | 每个浏览器一份匿名 owner（cookie `sm_owner`，一年有效），运行、历史、导出、追问、停止、筛选留痕**全部按 owner 校验**：同一个链接下不同的人只看到自己的记录，猜 id 也读不到别人的。升级前的历史默认对所有人隐藏，由页面顶部提示条一键「接管为我的记录」（`POST /owner`）后只归接管者可见。**这是匿名令牌，不是登录**——真正的账号体系见 Roadmap 阶段 2 | `web.py` / `jobstore.py` |
+| | 自带模型 Key（BYOK） | 页面左上角折叠的「🔑 模型与 API Key」让每个浏览器选择 DeepSeek / OpenAI GPT / Anthropic Claude / Google Gemini / 通义千问 / xAI Grok / Mistral / Cohere / Groq / OpenRouter / 百度文心 / 腾讯混元 / MiniMax / Moonshot Kimi / 智谱 GLM / 字节豆包 / 硅基流动 / 自定义 OpenAI 兼容服务，并填写自己的 key；未配置就提问会弹出设置提醒。配置存在浏览器 localStorage，随运行请求放在 `X-LLM-Config` 头里；服务端只在任务执行期间驻留内存，不写任务表/历史快照。默认不允许回退到服务器 key | `web.py` / `llm.py` |
+| | 免 Key 免费体验 | 页面把厂商免费层标为「✅ 免费层」、新用户赠送/试用额度标为「🎁 新用户赠送/试用」；没有 Key 的用户可在设置提醒弹窗里选择管理员已配置的免费模型。浏览器只发送厂商与模型（`X-LLM-Free-Config`），服务端按**固定 allow-list** 取自己的 Key，Key 不下发；每浏览器每日限额 + 可选全站每日限额。未配置免费 Key 时明确提示「管理员尚未配置」，不会回退到 DeepSeek/OpenAI 等付费服务器额度 | `web.py` / `llm.py` |
 | 可观测 | 异步任务 | `POST /ask` 返回 job id，`GET /status?id=` 轮询分阶段进度与实时日志；任务状态存在**任务表**里，重启后 `/status` 仍能查到（排队中的任务重启后自动接着跑） | `web.py` / `jobstore.py` |
 | | 管线结构面板 | 节点/连边从**已编译的 LangGraph** 运行时读取，并显示本次各节点耗时条 | `graph.py` / `web.py` |
 | | 检索统计表 | 逐轮 × 逐检索词 × 逐源显示命中数、耗时、错误、跳过原因；经典锚点行单独标注 | `web.py` |
@@ -59,7 +61,7 @@
 | | 安全边界 | 严格 run id 与 owner 校验、请求体上限、下载 URL/重定向校验、前端链接白名单、CSV 公式注入防护 | `web.py` / `fulltext.py` / `exports.py` |
 | | 任务租约 | SQLite 任务表记录 `worker(host:pid)` 与心跳；重启只结算已退出/失联实例的任务 | `jobstore.py` |
 | | 离线评测 | 检索 Recall@K 金标准回归 + 快照质量汇总 | `eval.py` |
-| | 测试 | `tests/` 纳入版本管理：21 个离线套件 + 7 个 stdlib unittest | `tests/` |
+| | 测试 | `tests/` 纳入版本管理：23 个离线套件 + 7 个 stdlib unittest | `tests/` |
 | | 接口 | `/ask`、`/chat`、`/status`、`/history`、`/history/<id>`、`/graph`、`/citegraph`、`/poolgraph`、`/paperinfo`、`/screening`、`/export`、`/pdfpack` | `web.py` |
 
 ## 一、整体管线（LangGraph 节点）
@@ -105,16 +107,16 @@ flowchart TD
 
 | 节点 | 阶段 | 做什么 | 状态变化（输入 → 输出） | 实现 |
 |---|---|---|---|---|
-| `plan_queries` | ① 查询规划 | DeepSeek 把问题拆成 2-3 条英文检索词（失败退回原问题） | `question` → `queries` | `graph.py / llm.py` |
+| `plan_queries` | ① 查询规划 | LLM 把问题拆成 2-3 条英文检索词（失败退回原问题） | `question` → `queries` | `graph.py / llm.py` |
 | `retrieve` | ② 检索 | 6 个数据源 × 全部检索词并行检索，跨源去重合并、记录逐词逐源命中；首轮追加 ②b **经典锚点检索**（前 2 条检索词按被引量排序，捞回高被引奠基工作） | `queries` `rounds` `pool` `filters` → `pool` `rounds` `retrieval_log` | `search.py` |
-| `rerank` | ③ 重排 | ask：DeepSeek 相关性打分取 top 20；search：按所选字段排序且不截断 | `question` `pool` `mode` `sort` → `papers` `scores`（池空时直接写 `answer` 结束） | `rerank.py` |
+| `rerank` | ③ 重排 | ask：LLM 相关性打分取 top 20；search：按所选字段排序且不截断 | `question` `pool` `mode` `sort` → `papers` `scores`（池空时直接写 `answer` 结束） | `rerank.py` |
 | `screen_retractions` | ④ 撤稿筛查 | OpenAlex 批量 + Crossref DOI/标题反查，标注已撤稿论文；**仅检索模式默认跳过**（可勾选开启） | `papers` `screen_retractions` → `retraction` | `retraction.py` |
-| `score_evidence` | ④b 证据评分 | 10 个维度逐篇打分（9 维由 DeepSeek 判、影响力本地计算），按用户权重合成总分与等级，并跨论文检出矛盾结论；**仅智能问答模式**，且未勾选时秒级跳过（仅搜索论文模式一律跳过） | `papers` `weights` `target_species` `score_evidence` → `papers`（附 `evidence`）`evidence` | `scoring.py` |
+| `score_evidence` | ④b 证据评分 | 10 个维度逐篇打分（9 维由 LLM 判、影响力本地计算），按用户权重合成总分与等级，并跨论文检出矛盾结论；**仅智能问答模式**，且未勾选时秒级跳过（仅搜索论文模式一律跳过） | `papers` `weights` `target_species` `score_evidence` → `papers`（附 `evidence`）`evidence` | `scoring.py` |
 | `generate` | ⑤ 生成回答 | 基于 top-N 论文写带 [n] 行内引用与 References 的综述 | `question` `papers` → `answer` | `graph.py / llm.py` |
 | `format_papers` | ✅ 输出论文列表 | search 模式终点：直接输出论文列表，不做校验（与 generate 互斥） | `papers` `sort` → `answer` | `graph.py` |
-| `critique` | ⑥ 证据充分性评估 | DeepSeek 判断证据是否充分，不足则给出 follow-up 检索词 | `question` `papers` `answer` → `verdict` `queries` | `graph.py / llm.py` |
+| `critique` | ⑥ 证据充分性评估 | LLM 判断证据是否充分，不足则给出 follow-up 检索词 | `question` `papers` `answer` → `verdict` `queries` | `graph.py / llm.py` |
 | `verify_rules` | ⑦ 三层校验 1/3 | 规则层：[n] 是否映射到论文且标题匹配、是否引用了已撤稿论文 | `answer` `papers` → `rule_audit` `reports` | `verify.py` |
-| `verify_llm` | ⑧ 三层校验 2/3 | 归因层：每条引用是否被该论文摘要支持（DeepSeek） | `answer` `papers` → `llm_audit` `reports` | `verify.py` |
+| `verify_llm` | ⑧ 三层校验 2/3 | 归因层：每条引用是否被该论文摘要支持（LLM） | `answer` `papers` → `llm_audit` `reports` | `verify.py` |
 | `verify_sentences` | ⑨ 三层校验 3/3 | 逐句层：按小节拆声明 → 逐声明取证 → 全文段落 → 判决/强度徽标 | `answer` `papers` `pool` `deep_verify` → `claim_audit` `reports` | `sentences.py / fulltext.py` |
 | `explore_scope` | 🔭 领域拆解 | 把领域（或选中的方向）切成 3-6 个可分别调研的方向，每个方向给中/英文名、一句话角色、2-3 条英文检索词，并把**按被引量挑出的 3 篇代表作**附在卡片上 | `question` `explore_action` `explore_parent` `explore_path` `explore_seen` → `explore_directions` `explore_meta` | `explore.py / llm.py` |
 | `survey_plan` | 🔭 综述检索规划 | 把选中方向的检索词**轮转合并去重**（每个方向都占份额，不会把预算花在第一个方向）后交给常规检索链 | `directions` → `queries` | `explore.py` |
@@ -242,7 +244,7 @@ python3 -c "import graph; print(graph.get_app().get_graph().draw_mermaid())"
 - 单一“相关性”分数表达不了证据能不能用：机制类结论与临床结论需要的支撑不同。所以每篇论文在 **10 个维度**上独立打 0-100 分，再按**用户设定的权重**合成总分与等级。
 - 维度与默认权重：相关性 5、直接性 4、方法可靠性 5、重复验证 4、结构支持 1、数据完整性 4、物种匹配 3、影响力 2、偏倚风险 4、矛盾证据 4。UI 上是 10 个滑杆（0-5），**拖到 0 即忽略该维度**；另有 5 套预设：均衡 / 机制·结构优先 / 实验验证优先 / 临床·转化 / 快速初筛。权重与目标物种自动保存；Web 端按匿名 owner 写入 `outputs/scoring-<owner>.json`，不同浏览器互不覆盖，CLI 仍使用全局 `outputs/scoring_weights.json`，下次提问直接生效。
 - **风险维度反向计入**：偏倚风险与矛盾证据按 `100 − 得分` 参与合成，因此**总分始终是「越高越好」**，把「偏倚风险」权重调高只会更严格，不会让烂论文得分更高。
-- **9 个维度由 DeepSeek 判**（相关性、直接性、方法可靠性、重复验证、结构支持、数据完整性、物种匹配、偏倚风险、矛盾证据），每篇输出 10 个分数 + 一句中文评分说明；**影响力在本地计算**（引用速度 `cites/年` 取对数 + 发表载体，不写死任何期刊排名），因此不花模型调用也不会随运行漂移。
+- **9 个维度由 LLM 判**（相关性、直接性、方法可靠性、重复验证、结构支持、数据完整性、物种匹配、偏倚风险、矛盾证据），每篇输出 10 个分数 + 一句中文评分说明；**影响力在本地计算**（引用速度 `cites/年` 取对数 + 发表载体，不写死任何期刊排名），因此不花模型调用也不会随运行漂移。
 - **物种匹配**需要用户填「目标物种」（如 `human` / `mouse`）：留空时该维度权重自动置 0，不会拿未知物种去硬打分；填了则按是否符合目标物种给分。
 - **跨论文矛盾检测**：单篇摘要不可能知道「另一篇结论和它相反」，所以评分后追加一次全结果集的比对，检出结论真正冲突的论文对，把双方「矛盾证据」维度上调（`max(原分, 55 + 15×冲突数)`）并在卡片上标 `⚠️ 与 N 篇结论冲突`。实测构造的对立 RCT 能被检出并互相标记。
 - 打分为**并行批量**（默认每批 4 篇、4 并发），实测 40 篇 5.9s；单批失败只让该批论文变成「部分维度」并标注，不会中断管线。一次运行最多评分 `SCORING_MAX_PAPERS`（默认 40）篇，超出部分标记为未评分而不是悄悄丢掉。
@@ -338,7 +340,7 @@ python3 -c "import graph; print(graph.get_app().get_graph().draw_mermaid())"
 
 ## 三、技术选型
 
-- LLM 统一为 DeepSeek `deepseek-chat`（规划/重排/生成/批评/校验），封装于 `llm.py`，JSON 输出有容错解析。
+- LLM 统一封装于 `llm.py`（规划/重排/生成/批评/校验），JSON 输出有容错解析。Web 默认要求每个浏览器通过左上角折叠的「🔑 模型与 API Key」自带配置，未配置就提问会弹出设置提醒：内置 DeepSeek、OpenAI GPT（Responses API）、Anthropic Claude（Messages API）、Google Gemini（Interactions API）、通义千问、xAI Grok、Mistral、Cohere、Groq、OpenRouter、百度文心、腾讯混元、MiniMax、Moonshot Kimi、智谱 GLM、字节豆包、硅基流动和自定义 OpenAI 兼容服务；各服务的端点、鉴权头与默认模型均按官方 API 文档核对，见 `docs/llm-providers.md`。没有 Key 的用户还可使用管理员配置的免 Key 免费体验（固定 allow-list 模型、服务端持有 Key、按浏览器与全站限额）；未配置时只显示「管理员尚未配置」，不会回退到付费服务器额度。内置服务的 Base URL 固定在服务端，浏览器只能覆盖模型名；自定义 Base URL 只允许 HTTPS 公网地址，并拦截回环/私网/元数据地址与不安全重定向。命令行仍使用 `.env` 的 `LLM_PROVIDER` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`；只有显式设置 `LLM_ALLOW_SERVER_DEFAULT=1` 时，Web 任务才允许回退到服务器 key。
 - 无向量库/无数据库：论文池为内存 dict，段落检索为词法 BM25（英文词 + 中文 bigram）。
 - Web 为纯标准库 `http.server`，无前端框架/无外部依赖。
 
@@ -358,7 +360,25 @@ cp .env.example .env   # 填入你的 API key
 
 | 键 | 必填 | 说明 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | ✅ | 所有 LLM 环节 |
+| `LLM_PROVIDER` | 可选 | 服务器默认/CLI 使用：`deepseek`（默认）或 `openai`；也接受 `gpt` 作为 `openai` 的别名 |
+| `LLM_ALLOW_SERVER_DEFAULT` | 可选 | 默认 `0`：Web 任务没有用户配置时直接拒绝，不消耗服务器额度；仅可信单用户部署可设 `1` 显式启用服务器 key 回退 |
+| `DEEPSEEK_API_KEY` | DeepSeek 必填 | 选择 `LLM_PROVIDER=deepseek` 时使用 |
+| `DEEPSEEK_MODEL` | 可选 | DeepSeek 模型，默认 `deepseek-flash`（旧版 `deepseek-chat` 已不再作为默认值） |
+| `OPENAI_API_KEY` | OpenAI 必填 | 选择 `LLM_PROVIDER=openai` 时使用 |
+| `OPENAI_MODEL` | 可选 | GPT 模型，默认 `gpt-6.1-sol` |
+| `OPENAI_BASE_URL` | 可选 | OpenAI API 根地址，默认 `https://api.openai.com/v1` |
+| `OPENAI_API_STYLE` | 可选 | `responses`（默认，官方推荐）或 `chat`（仅支持 `/chat/completions` 的兼容网关） |
+| `OPENAI_MIN_OUTPUT_TOKENS` | 可选 | Responses API 的最小输出预算，默认 `2048`；小校验调用不会被 reasoning token 吃光 |
+| `OPENAI_REASONING_EFFORT` | 可选 | 传给 Responses API 的 reasoning effort（如 `low`）；不设则不传，按模型默认 |
+| `GEMINI_API_KEY` | 可选 | 启用「免 Key 免费体验」的 Gemini 免费层；只服务固定模型 `gemini-3.8-flash` |
+| `GROQ_API_KEY` | 可选 | 启用 Groq Free Plan 的 `openai/gpt-oss-120b` |
+| `ZHIPU_API_KEY` | 可选 | 启用智谱免费文本模型 `GLM-4.7-Flash` |
+| `OPENROUTER_API_KEY` | 可选 | 启用 OpenRouter 免费模型 `minimax/minimax-m3.1-flash:free` |
+| `COHERE_API_KEY` | 可选 | 启用 Cohere 试用 Key；官方文档标注约 1000 次 API 调用/月，接口仍受试用限额约束 |
+| `BAIDU_API_KEY` | 可选 | 启用百度文心新用户免费额度，固定模型 `ERNIE-4.5-Turbo-128K` |
+| `HUNYUAN_API_KEY` | 可选 | 启用腾讯混元新用户免费额度，固定模型 `hunyuan-a13b` |
+| `FREE_LLM_DAILY_REQUESTS` | 可选 | 每个浏览器每天最多几次免 Key 免费体验，默认 `5`；设 `0` 关闭免费体验 |
+| `FREE_LLM_GLOBAL_DAILY_REQUESTS` | 可选 | 整个 Web 进程每天最多几次免费体验，默认 `50`；设 `0` 取消全站上限（仍保留每浏览器上限） |
 | `S2_API_KEY` | 建议 | Semantic Scholar 高额度（缺省时 429 重试会拖慢检索） |
 | `OPENALEX_MAILTO` | 可选 | OpenAlex polite pool（限速 10 → 100 req/s），同时作为 Crossref 的 polite-pool 地址（未设 `CROSSREF_MAILTO` 时） |
 | `OPENALEX_API_KEY` | 建议 | OpenAlex 免费 API key。OpenAlex 减压时会直接 429「Anonymous search is temporarily rate-limited while the search cluster is under elevated load」，**这个 429 用 mailto 解不掉，只有 API key 能解**（https://openalex.org/ → Settings → API key） |
@@ -416,12 +436,12 @@ cp .env.example .env   # 填入你的 API key
 | `JOBSTORE_STALE_S` | 可选 | 其他实例的 running 任务心跳超过多少秒才算失联，默认 `300`；同机任务优先用 PID 存活判断 |
 | `PROGRESS_FLUSH_S` | 可选 | 运行中把阶段/日志写回任务表的最小间隔秒数，默认 `2`（`/status` 读的是内存里的实时副本，不受此影响） |
 | `WEB_MAX_CONNECTIONS` | 可选 | Web 进程同时处理的连接数上限，默认 `128`（浏览器每标签页会占若干条，这是失控护栏而非吞吐指标；超出后新连接在监听队列排队） |
-| `WEB_CONCURRENCY` | 可选 | 同一进程内**同时执行**几个运行，默认 `1`（第二个人的任务在队列里等第一个人跑完）。设为 `2` 起两个执行线程，实测两路检索同时 `running`；注意每路都会消耗外部配额（DeepSeek / Semantic Scholar / SerpAPI），且各源的健康状态（熔断）是全进程共享的 |
+| `WEB_CONCURRENCY` | 可选 | 同一进程内**同时执行**几个运行，默认 `1`（第二个人的任务在队列里等第一个人跑完）。设为 `2` 起两个执行线程，实测两路检索同时 `running`；注意每路都会消耗外部配额（LLM / Semantic Scholar / SerpAPI），且各源的健康状态（熔断）是全进程共享的 |
 | `WEB_GRAPH_RATE_WINDOW` | 可选 | `/citegraph`、`/poolgraph`、`/paperinfo` 的滑动窗口秒数，默认 `60` |
 | `WEB_GRAPH_RATE_MAX` | 可选 | 每个 owner + 端点在上面的窗口内最多请求几次，默认 `10`；超出返回 429 + `Retry-After` |
 | `WEB_GRAPH_CONCURRENCY` | 可选 | 进程内同时构建图谱的上限，默认 `3`；占满时返回 503 + `Retry-After` |
 
-**多实例边界**：任务表会把 `worker`（`host:pid`）与心跳写进 SQLite，启动恢复只结算无主旧行、同机已退出进程、或其他主机心跳超时的任务，不会再把另一个实例正在跑的任务标成中断。但身份仍是匿名 owner，检索熔断与跨用户检索缓存仍是**单进程内存状态**；多实例部署尚未完成，不能把这些状态当成跨实例共享。
+**多实例边界**：任务表会把 `worker`（`host:pid`）与心跳写进 SQLite，启动恢复只结算无主旧行、同机已退出进程、或其他主机心跳超时的任务，不会再把另一个实例正在跑的任务标成中断。但身份仍是匿名 owner，检索熔断与跨用户检索缓存仍是**单进程内存状态**；多实例部署尚未完成，不能把这些状态当成跨实例共享。用户 LLM key 的任务映射同样是进程内内存：多实例负载均衡必须把任务粘性路由到接收 `/ask` 的实例，或后续接入共享密钥存储；找不到配置时任务会明确失败，不会回退服务器额度。
 
 **安全与资源边界（P2）**：
 - run id 只接受 `YYYYMMDD_HHMMSS_ffffff`，快照路径再校验 realpath 仍在 `outputs/history/`；历史、导出、筛选、取消、续跑和追问都按 owner 校验，无主旧快照不会被浏览器直接读取。
@@ -430,12 +450,13 @@ cp .env.example .env   # 填入你的 API key
 - 全文内存缓存、OpenAlex 地址映射和落盘跳过标记都有条数/字符上限；不可用地址按 URL 记录并定期清理。
 - 撤稿筛查是硬墙钟截止：到点立即返回，尚在途的请求在后台结束；逐句判决缺少结果或字段时标记「无法核对（判决未完成）」，不会误记为「不支持」。
 - 图表构建端点按 owner + 端点限流，并限制进程内并发；证据评分权重按 owner 分开保存，CLI 继续使用全局文件。
+- Web 的 LLM key 由浏览器持有并以 `X-LLM-Config` 发送；服务端只在当前任务期间保存在内存，任务表只记录 `llm_user_config` 标记和非敏感的模型名。服务重启导致待跑任务的 key 丢失时，任务会明确失败，不会静默改用服务器额度。免 Key 免费体验走另一条路径：浏览器只发送 allow-list 中的厂商/模型，服务端持有免费层 Key，并按浏览器与全站每日限额保护额度；限额计数在进程内，是防滥用护栏而不是计费系统。自定义 Base URL 还必须通过 HTTPS、公网 IP 和重定向校验，避免把服务端变成内网请求代理。**生产部署必须使用 HTTPS 反向代理**：当前示例链接是 HTTP，key 在浏览器到服务器的这一段没有传输加密。
 - CSV 以 `= + - @` 开头的字符串单元格会前置 `'`，数值类型的年份/被引量/负数保持数值，避免 Excel 公式注入。
 
 ### 网络与代理（检索全空时先看这里）
 
 本机**直连外网不通**，所有外部请求必须走代理；`.env` 里的 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
-就是给这件事用的（`.env` 不进仓库，`.env.example` 只放注释模板）。缺了它们，六个数据源和 DeepSeek
+就是给这件事用的（`.env` 不进仓库，`.env.example` 只放注释模板）。缺了它们，六个数据源和 LLM
 会**同时**失败。
 
 - 判别方法：报 `Connection refused` = 代理进程没跑或地址/端口变了；报 `timed out` = 没走代理、在直连。
@@ -500,7 +521,7 @@ Web 使用要点：
 python3 eval.py --data eval_data/gold.jsonl          # 检索 Recall@20 vs 金标准
 python3 eval.py --mode snapshot --snapshots outputs/history   # 快照质量汇总
 python3 -m unittest discover -s tests -v                       # stdlib 单元测试
-python3 -m tests.run_offline                                   # 21 个离线套件
+python3 -m tests.run_offline                                   # 23 个离线套件
 ```
 
 ## 六、模块结构
@@ -509,12 +530,12 @@ python3 -m tests.run_offline                                   # 21 个离线套
 - `search.py` — 多源检索层（第一梯队 S2/OpenAlex/Scholar + 第二梯队 arXiv/Europe PMC/Crossref），数据源注册表 + 并行调度 + 独立限速/超时 + 失败熔断，过滤、跨源去重合并与溯源、`search_many_detailed` 检索统计，以及按被引量排序的经典锚点通道 `search_classics()`（只对声明了 `sort` 参数的源生效）。
 - `journal.py` — 刊物层级（正刊/子刊/一区–四区）：内置规则、本地分区表（`outputs/journal_tiers.json`，用户写入的行永不被覆盖）、OpenAlex 影响力估算（带并发查询与失败熔断）、每运行一份的 `TierFilter`（`contextvars` 隔离，跑完把统计交给 UI）；Google Scholar 那种被 Google 截断的刊物名（`Advanced Energy …`）一律不猜，按「未分类」处理。
 - `citationgraph.py` — 文献关系图谱。`build(seed)`：给定一篇论文（DOI / OpenAlex ID / 标题，或先用 Semantic Scholar 把主题词反查成 DOI），抓它的「参考了什么」与「被谁引用」，再用共同引用数算两两相似度，返回一份可独立渲染的图数据（节点含年份/被引/核心度/相似度与 prior/derivative 角色，边含 `cites` / `coupled` 两种）。核心度是**图内共被引强度**（先行文献＝种子的引用者里有多少篇也引用它；后续文献＝引用了多少篇本领域奠基工作），不是被引量；跨领域的后续文献会被剔除，剔除后过少则放宽并给出 `warnings`。请求自带 3 次重试（连接级失败尤其常见），并发抓取分批进行。`build_pool(papers)` 是整轮版（`kind="pool"`）：以本轮论文为节点（有 DOI 或 arXiv 号才进图，上限 `POOL_MAX=40`，超出的计入 `stats.truncated`），再加「被 ≥2 篇共同引用的奠基文献」（上限 24 篇）；参考文献表由 Semantic Scholar 一次批处理 POST 取全、缺口用 OpenAlex `referenced_works` 补（OpenAlex id 分块换 DOI 才能求交），节点年份/被引统一取 OpenAlex；核心度分角色归一化（本轮论文＝图内连到几篇同批论文，奠基文献＝本批引用它的篇数），`warnings` 如实记录取不到参考文献表的篇数、跨源补漏失败、孤立点与截断——稀疏是数据本身的形状，不美化。`paper_info(key)` 服务「点开一个圆圈」：key 与建图的起点同一套（OpenAlex ID / DOI / 标题，标题走 `resolve()` 的 S2 兜底），返回一条与检索结果同形的记录（含 OpenAlex `abstract_inverted_index` 还原出的摘要、全部作者、OA PDF 链接、撤稿标记）；取不到返回 `None`，不抛错。
-- `llm.py` — DeepSeek 封装（OpenAI 兼容，读 `.env`）。
+- `llm.py` — 多家 LLM 的统一封装：OpenAI Responses / Chat Completions、Anthropic Messages、Gemini Interactions 与 OpenAI 兼容接口；Web 使用浏览器自带 key，CLI 读 `.env`。官方端点与模型依据见 `docs/llm-providers.md`。
 - `verify.py` — 规则校验 + LLM 归因，含结构化 `llm_audit / audit_rules`。
 - `sentences.py` — 逐句证据校验（声明拆分 → 证据检索 → 判决 → 支持论文证据补取），返回结构化 `verdicts`（含 `evidence` 原文片段与 `badge` 证据强度）；`run(answer, papers, pool)` 中 `papers` 必须是回答的编号坐标系（`state["papers"]`）。
 - `retraction.py` — 撤稿筛查（OpenAlex 批量 + Crossref 兜底 + 标题启发式，磁盘缓存与墙钟预算）。
 - `fulltext.py` — 开放 PDF 下载/抽取/分块/BM25（纯标准库）；并发预取、超时/截止控制、缓存命中统计。
-- `rerank.py` — DeepSeek 相关性重排（论文池/证据段落；失败回退原序）。
+- `rerank.py` — LLM 相关性重排（论文池/证据段落；失败回退原序）。
 - `exports.py` — BibTeX / RIS / GB/T 7714 / CSL-JSON 导出 + 论文清单 CSV（含摘要）+ PRISMA 式筛选台账（CSV / Markdown）+ 证据评分表（CSV）。
 - `explore.py` — 领域探索：拆方向 / 深入的两个提示词、方向规范化、代表作预览（按被引量从相关命中选择）、方向检索词轮转合并。
 - `chat.py` — 追问对话：把工作论文集（编号与回答一致）、上一轮回答与对话历史拼成上下文，并标注本轮新补检索的论文，产出 `{answer, needs_new_search, search_query}`；JSON 解析失败时退化为纯 Markdown 再问一次，不让一次格式抖动吃掉一整轮。
@@ -576,6 +597,8 @@ python3 -m tests.run_offline                                   # 21 个离线套
 - [x] **多用户加固（阶段 0）**：取消按运行隔离（`graph.begin_run()` / `request_cancel(key)`，停一个运行不再杀别的运行）｜所有落盘改原子写（`atomicio.py`）｜Web 连接上限 `WEB_MAX_CONNECTIONS` 与 30s 空闲超时（客户端异常不再无限增长线程）
 - [x] **历史记录按用户隔离（匿名 owner）**：每个浏览器一份 `sm_owner` cookie，运行/历史/导出/追问/停止/筛选留痕全部按 owner 校验（同链接不同人互不可见，猜 id 得到 404）；升级前的无主记录默认隐藏，可由页面提示条一键接管（`POST /owner`）
 - [x] **多用户（阶段 1）· 并发执行**：同一进程可开多个执行线程（`WEB_CONCURRENCY`，生产设 `2`），`claim_next()` 保证一个任务只被认领一次。为此把原先「一次只跑一个运行」假设下的**进程级状态**改成按运行存放：进度/耗时回调（`graph.install_hooks()`，键为 run key）、逐句阶段的取消钩子与全文阶段截止时间（`contextvars`，并在每个线程池提交处传 `copy_context()`，这样池内线程也看得到）、以及运行日志的输出路由（`web._StdoutRouter`：`contextlib.redirect_stdout` 会换掉进程级 `sys.stdout`，两路同时跑会把两路的日志混给后安装的那个任务）。实测：两路检索同时 `running`、日志各自归属、停一路另一路继续跑完
+- [x] **多用户（阶段 1）· 自带 LLM Key**：每个浏览器独立选择模型服务、模型名和 API Key（内置 DeepSeek、OpenAI、Anthropic、Gemini、通义千问、xAI、Mistral、Cohere、Groq、OpenRouter、百度文心、腾讯混元、MiniMax、Kimi、智谱、豆包、硅基流动与自定义兼容服务），任务通过 `ContextVar` 使用自己的配置与额度；服务端默认拒绝无配置的 Web 运行，密钥不落任务库/快照，重启丢 key 时任务明确失败而不是回退服务器额度
+- [x] **多用户（阶段 1）· 免 Key 免费体验**：页面标注厂商免费层与新用户赠送额度；管理员配置 `GEMINI_API_KEY` / `GROQ_API_KEY` / `ZHIPU_API_KEY` / `OPENROUTER_API_KEY` / `COHERE_API_KEY` / `BAIDU_API_KEY` / `HUNYUAN_API_KEY` 后，无 Key 用户可从弹窗选择固定免费/试用模型。服务端 allow-list 校验厂商与模型，Key 不下发；每浏览器每日限额与全站每日限额共同保护额度，未配置时明确提示而不回退付费 key
 - [x] **Web 输入与归属安全**：run id 白名单 + realpath 边界、owner 校验覆盖历史/导出/追问/取消/续跑/筛选、请求体大小与 JSON 类型校验、下载 URL 与重定向校验、前端链接白名单
 - [x] **P2 资源与篡改边界**：撤稿筛查硬截止、PDF 解压上限、全文缓存/开放获取地址映射/跳过标记有界、CSV 公式注入防护、源码筛选路径纵深校验、单源请求配置显式重置
 - [x] **P2 任务租约与 checkpoint**：任务表记录 `worker(host:pid)` 与心跳，重启只清理同机已退出或他机心跳过期任务；checkpoint 按最近使用淘汰并排除活跃运行

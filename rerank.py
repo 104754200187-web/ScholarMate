@@ -1,6 +1,6 @@
 """LLM-based reranking (pure stdlib).
 
-DeepSeek scores candidates by relevance: paper pool vs. the research question
+The configured LLM scores candidates by relevance: paper pool vs. the research question
 (used before generation), and BM25 full-text passages vs. a claim (used before
 the per-claim judge). Falls back to the original order when the LLM call or
 parsing fails. Disable entirely with RERANK=0.

@@ -42,7 +42,7 @@ RECURSION_LIMIT = int(os.environ.get("LANGGRAPH_RECURSION_LIMIT", str(6 * MAX_RO
 RETRACTION_IN_SEARCH = os.environ.get("RETRACTION_IN_SEARCH", "0") != "0"
 PAPERS_PER_QUERY = 8
 # LangGraph checkpointer: every super-step is snapshotted per thread, so a run
-# that dies (a DeepSeek outage, a killed server) can be resumed from the last
+# that dies (an LLM outage, a killed server) can be resumed from the last
 # completed node instead of paying for the whole retrieval again. In-memory
 # only -- it survives a failed *run*, not a restarted process.
 CHECKPOINT_ENABLED = os.environ.get("LANGGRAPH_CHECKPOINT", "1") != "0"
@@ -404,17 +404,17 @@ NODE_INFO = {
     "explore_scope": ("🔭 领域拆解", "把领域（或选中的方向）展开成 3-6 个可分别调研的方向，每个方向取 3 篇高被引代表作",
                       "explore.py / llm.py"),
     "survey_plan": ("🔭 综述检索规划", "把选中方向的检索词轮转合并去重，交给常规检索链", "explore.py"),
-    "plan_queries": ("① 查询规划", "DeepSeek 把问题拆成 2-3 条英文检索词（失败退回原问题）", "graph.py / llm.py"),
+    "plan_queries": ("① 查询规划", "LLM 把问题拆成 2-3 条英文检索词（失败退回原问题）", "graph.py / llm.py"),
     "retrieve": ("② 检索", "6 个数据源 × 全部检索词并行检索，跨源去重合并；首轮追加一路按被引量排序的经典锚点检索",
                  "search.py"),
-    "rerank": ("③ 重排", "ask：DeepSeek 相关性打分取 top 20；search：按所选字段排序且不截断", "rerank.py"),
-    "score_evidence": ("④b 证据评分", "10 个维度逐篇打分（9 维由 DeepSeek 判、影响力本地算），按用户权重合成总分与等级", "scoring.py"),
+    "rerank": ("③ 重排", "ask：LLM 相关性打分取 top 20；search：按所选字段排序且不截断", "rerank.py"),
+    "score_evidence": ("④b 证据评分", "10 个维度逐篇打分（9 维由 LLM 判、影响力本地算），按用户权重合成总分与等级", "scoring.py"),
     "screen_retractions": ("④ 撤稿筛查", "OpenAlex 批量 + Crossref DOI/标题反查，标注已撤稿论文", "retraction.py"),
     "generate": ("⑤ 生成回答", "基于 top-N 论文写带 [n] 行内引用与 References 的综述", "graph.py / llm.py"),
     "format_papers": ("✅ 输出论文列表", "search 模式终点：直接输出论文列表，不做校验（与 generate 互斥）", "graph.py"),
-    "critique": ("⑥ 证据充分性评估", "DeepSeek 判断证据是否充分，不足则给出 follow-up 检索词", "graph.py / llm.py"),
+    "critique": ("⑥ 证据充分性评估", "LLM 判断证据是否充分，不足则给出 follow-up 检索词", "graph.py / llm.py"),
     "verify_rules": ("⑦ 三层校验 1/3", "规则层：[n] 是否映射到论文且标题匹配、是否引用了已撤稿论文", "verify.py"),
-    "verify_llm": ("⑧ 三层校验 2/3", "归因层：每条引用是否被该论文摘要支持（DeepSeek）", "verify.py"),
+    "verify_llm": ("⑧ 三层校验 2/3", "归因层：每条引用是否被该论文摘要支持（LLM）", "verify.py"),
     "verify_sentences": ("⑨ 三层校验 3/3", "逐句层：拆声明 → 逐声明取证 → 全文段落 → 判决/强度徽标", "sentences.py / fulltext.py"),
     "chat_answer": ("💬 追问回答", "不重新检索：只用本次工作论文集 + 上一轮回答作答，引用编号与之一致；材料不够时明确要求补检索",
                     "chat.py / llm.py"),
@@ -724,7 +724,7 @@ def survey_target(state):
 
 
 def node_plan_queries(state):
-    _emit("① 查询规划：DeepSeek 将问题拆成 2-3 条英文检索词…")
+    _emit("① 查询规划：LLM 将问题拆成 2-3 条英文检索词…")
     return {"queries": plan_queries(state["question"])}
 
 
@@ -833,7 +833,7 @@ def node_rerank(state):
             scores = []
             print(f"      [rerank] scoring failed; keeping all {len(papers)} papers")
         return {"papers": papers, "scores": scores}
-    _emit("③ 重排：DeepSeek 按与问题的相关性给论文池打分")
+    _emit("③ 重排：LLM 按与问题的相关性给论文池打分")
     reranked = rerank.rerank_papers(target, pool_papers, top_k=cap)
     if reranked:
         papers = [p for p, _ in reranked]
@@ -993,7 +993,7 @@ def node_verify_llm(state):
         audit = verify.llm_audit(state["answer"], state["papers"])
     except Exception as e:
         audit = {
-            "lines": ["--- LLM citation verification (DeepSeek) ---", f"BAD LLM check failed: {e}"],
+            "lines": ["--- LLM citation verification ---", f"BAD LLM check failed: {e}"],
             "verdicts": [],
         }
     return {"reports": [audit["lines"]], "llm_audit": audit}
